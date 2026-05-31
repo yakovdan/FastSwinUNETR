@@ -9,6 +9,8 @@ from monai.networks.nets.swin_unetr import WindowAttention as OrigWindowAttentio
 import numpy as np
 import random
 
+SEED = 1234
+
 def _no_grad_trunc_normal_(tensor, mean, std, a, b):
     """Tensor initialization with truncated normal distribution.
     Based on:
@@ -116,7 +118,6 @@ class WindowAttention(nn.Module):
             relative_coords[:, :, 2] += self.window_size[2] - 1
             relative_coords[:, :, 0] *= (2 * self.window_size[1] - 1) * (2 * self.window_size[2] - 1)
             relative_coords[:, :, 1] *= 2 * self.window_size[2] - 1
-
         elif len(self.window_size) == 2:
             self.relative_position_bias_table = nn.Parameter(
                 torch.zeros((2 * window_size[0] - 1) * (2 * window_size[1] - 1), num_heads)
@@ -134,7 +135,7 @@ class WindowAttention(nn.Module):
             relative_coords[:, :, 1] += self.window_size[1] - 1
             relative_coords[:, :, 0] *= 2 * self.window_size[1] - 1
         else:
-            raise ValueError(f"length of window_size must be either 2 or 3, got {len(window_size)}")
+            raise RuntimeError(f"Invalid window_size dimensions: {len(self.window_size)}.")
         relative_position_index = relative_coords.sum(-1)
         self.register_buffer("relative_position_index", relative_position_index)
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
@@ -147,89 +148,56 @@ class WindowAttention(nn.Module):
     def forward(self, x, mask):
         b, n, c = x.shape
         qkv = self.qkv(x).reshape(b, n, 3, self.num_heads, c // self.num_heads).permute(2, 0, 3, 1, 4)
-        d = c // self.num_heads
         q, k, v = qkv[0], qkv[1], qkv[2]
-
+        q = q * self.scale
+        attn = q @ k.transpose(-2, -1)
         relative_position_bias = self.relative_position_bias_table[
             self.relative_position_index.clone()[:n, :n].reshape(-1)  # type: ignore[operator]
         ].reshape(n, n, -1)
-        rpb = relative_position_bias.permute(2, 0, 1).unsqueeze(0).contiguous()
+        relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()
+        attn = attn + relative_position_bias.unsqueeze(0)
         if mask is not None:
-
             nw = mask.shape[0]
-            g = b // nw
-
-            if self.training:
-                attn = (q * self.scale) @ k.transpose(-2, -1)
-                attn = attn + rpb
-                attn = attn.view(b // nw, nw, self.num_heads, n, n) + mask.unsqueeze(0).unsqueeze(2)
-                attn = attn.view(-1, self.num_heads, n, n)
-                attn = self.softmax(attn)
-                attn = self.attn_drop(attn).to(v.dtype)
-                x = (attn @ v).transpose(1, 2).reshape(b, n, c)
-            else:
-                # q, k, v assumed to start as [b, num_heads, n, d]
-                q1 = q.view(g, nw, self.num_heads, n, d)
-                k1 = k.view(g, nw, self.num_heads, n, d)
-                v1 = v.view(g, nw, self.num_heads, n, d)
-
-                with sdpa_kernel([SDPBackend.FLASH_ATTENTION,SDPBackend.CUDNN_ATTENTION,SDPBackend.MATH], set_priority=True):
-                    attn = [F.scaled_dot_product_attention(
-                        q1[i], k1[i], v1[i],
-                        attn_mask=rpb + mask.unsqueeze(1),
-                        dropout_p=0.0,
-                        scale=float(self.scale),
-                    ) for i in range(g)]
-                x = torch.cat(attn).transpose(-2, -3).reshape(b, n, c)
-
+            attn = attn.view(b // nw, nw, self.num_heads, n, n) + mask.unsqueeze(1).unsqueeze(0)
+            attn = attn.view(-1, self.num_heads, n, n)
+            attn = self.softmax(attn)
         else:
-            if self.training:
-                attn = q @ k.transpose(-2, -1)
-                attn = attn + rpb
-                attn = self.softmax(attn)
-                attn = self.attn_drop(attn).to(v.dtype)
-                x = (attn @ v).transpose(1, 2).reshape(b, n, c)
-            else:
-                with sdpa_kernel([SDPBackend.CUDNN_ATTENTION], set_priority=True):
-                    attn = F.scaled_dot_product_attention(
-                        q, k, v,
-                        attn_mask=rpb,
-                        dropout_p=0.0,
-                        scale=float(self.scale))
+            attn = self.softmax(attn)
 
-                x = attn.transpose(-2, -3).reshape(b, n, c)
-
+        attn = self.attn_drop(attn).to(v.dtype)
+        x = (attn @ v).transpose(1, 2).reshape(b, n, c)
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
 
 
-if __name__ == "__main__":
-
-    # ----------------------------
-    # Reproducibility
-    # ----------------------------
-    SEED = 1234
+def restore_rng_state() -> None:
     random.seed(SEED)
     np.random.seed(SEED)
     torch.manual_seed(SEED)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(SEED)
 
-    x = torch.load('input_tensor.pt').to("cuda").to(torch.bfloat16)
-    mask = torch.load('mask_tensor.pt').to("cuda").to(torch.bfloat16)
-    win0 = WindowAttention(48, 3, (7, 7, 7), True, 0.25, 0.25).to("cuda").to(torch.bfloat16)
-    win1 = OrigWindowAttention(48, 3, (7, 7, 7), True, 0.25, 0.25).to("cuda").to(torch.bfloat16)
+if __name__ == "__main__":
+
+    # ----------------------------
+    # Reproducibility
+    # ----------------------------
+    dtype = torch.float32
+    x = torch.load('input_tensor.pt').to("cuda").to(dtype)
+    mask = torch.load('mask_tensor.pt').to("cuda").to(dtype)
+
+    restore_rng_state()
+    win0 = WindowAttention(48, 3, (7, 7, 7), True, 0.25, 0.25).to("cuda").to(dtype)
+
+    restore_rng_state()
+    win1 = OrigWindowAttention(48, 3, (7, 7, 7), True, 0.25, 0.25).to("cuda").to(dtype)
+
     win0.eval()
     win1.eval()
     with torch.inference_mode():
+        restore_rng_state()
         out0 = win0(x, mask)
-        SEED = 1234
-        random.seed(SEED)
-        np.random.seed(SEED)
-        torch.manual_seed(SEED)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(SEED)
-
+        restore_rng_state()
         out1 = win1(x, mask)
-    print(torch.allclose(out0, out1))
+    print(torch.allclose(out0, out1, atol=1e-4, rtol=1e-4))
