@@ -87,7 +87,7 @@ def _attn_fwd(
             other=0.0,
         )
 
-        QK_block = tl.dot(Q_block, K_T_block) * softmax_scale
+        QK_block = tl.dot(Q_block, K_T_block, input_precision="ieee") * softmax_scale
 
         keep = valid_q[:, None] & valid_kv[None, :]
 
@@ -102,7 +102,7 @@ def _attn_fwd(
         alpha = tl.exp(m_i - m_ij)
         l_ij = tl.sum(P_block, axis=1)
 
-        O_block = O_block * alpha[:, None] + tl.dot(P_block.to(tl.float32), V_block)
+        O_block = O_block * alpha[:, None] + tl.dot(P_block, V_block, input_precision="ieee")
         l_i = l_i * alpha + l_ij
         m_i = m_ij
 
@@ -238,20 +238,22 @@ def _attn_bwd_dq(
             other=0.0,
         )
 
-        QK_block = tl.dot(Q_block, K_T_block) * softmax_scale
-        P_block = tl.exp(QK_block - M_block)
+        QK_block = tl.dot(Q_block, K_T_block, input_precision="ieee") * softmax_scale
+
 
         keep = valid_q[:, None] & valid_kv[None, :]
 
         if CAUSAL:
             keep = keep & (offs_q[:, None] >= offs_kv[None, :])
 
+        QK_block = tl.where(keep, QK_block, -1.0e20)
+        P_block = tl.exp(QK_block - M_block)
         P_block = tl.where(keep, P_block, 0.0)
 
-        dP_block = tl.dot(dO_block, V_T_block).to(tl.float32)
+        dP_block = tl.dot(dO_block, V_T_block, input_precision="ieee")
         dS_block = P_block * (dP_block - D_block[:, None])
 
-        dQ_block += softmax_scale * tl.dot(dS_block.to(tl.float32), tl.trans(K_T_block))
+        dQ_block += softmax_scale * tl.dot(dS_block, tl.trans(K_T_block),input_precision="ieee")
 
     tl.store(
         dQ + offset + offs_q[:, None] * stride_seq + offs_d[None, :] * stride_dim,
@@ -340,22 +342,25 @@ def _attn_bwd_dk_dv(
             other=0.0,
         )
 
-        QK_T_block = tl.dot(K_block, Q_T_block) * softmax_scale
-        P_T_block = tl.exp(QK_T_block - M_block[None, :])
+        QK_T_block = tl.dot(K_block, Q_T_block, input_precision="ieee") * softmax_scale
 
         keep = valid_kv[:, None] & valid_q[None, :]
 
         if CAUSAL:
+            # P_T_block is [key, query], allowed iff key <= query.
             keep = keep & (offs_q[None, :] >= offs_kv[:, None])
+
+        QK_T_block = tl.where(keep, QK_T_block, -1.0e20)
+        P_T_block = tl.exp(QK_T_block - M_block[None, :])
 
         P_T_block = tl.where(keep, P_T_block, 0.0)
 
-        dV_block += tl.dot(P_T_block.to(tl.float32), dO_block)
+        dV_block += tl.dot(P_T_block, dO_block, input_precision="ieee")
 
-        dP_T_block = tl.dot(V_block, tl.trans(dO_block)).to(tl.float32)
+        dP_T_block = tl.dot(V_block, tl.trans(dO_block), input_precision="ieee")
         dS_T_block = P_T_block * (dP_T_block - D_block[None, :])
 
-        dK_block += softmax_scale * tl.dot(dS_T_block.to(tl.float32), tl.trans(Q_T_block))
+        dK_block += softmax_scale * tl.dot(dS_T_block.to(tl.float32), tl.trans(Q_T_block), input_precision="ieee")
 
     tl.store(
         dV + offset + offs_kv[:, None] * stride_seq + offs_d[None, :] * stride_dim,
@@ -561,8 +566,8 @@ def test_op(
     HEAD_DIM: int,
     causal: bool,
     dtype: torch.dtype = torch.float16,
-    atol: float = 2e-2,
-    rtol: float = 0.0,
+    atol: float = 1e-6,
+    rtol: float = 1e-6,
 ) -> None:
     torch.manual_seed(1234)
     torch.cuda.manual_seed_all(1234)
@@ -654,12 +659,13 @@ def benchmark_forward(
 
 
 if __name__ == "__main__":
-    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cuda.matmul.allow_tf32 = False
     torch.set_float32_matmul_precision("highest")
 
     # Small tests first.
     test_op(BATCH_SIZE=2, NUM_HEADS=3, SEQ_LEN=343, HEAD_DIM=16, causal=False, dtype=torch.float32)
     test_op(BATCH_SIZE=2, NUM_HEADS=3, SEQ_LEN=343, HEAD_DIM=16, causal=True, dtype=torch.float32)
+
 
     # Your actual dimensions.
     test_op(BATCH_SIZE=1176, NUM_HEADS=3, SEQ_LEN=343, HEAD_DIM=16, causal=False, dtype=torch.float32)
