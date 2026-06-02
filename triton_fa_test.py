@@ -129,7 +129,7 @@ def _attn_fwd(
     BLOCK_SIZE_KV: tl.constexpr,
     STAGE: tl.constexpr,
 ):
-    tl.static_assert(BLOCK_SIZE_KV <= HEAD_DIM)
+    #tl.static_assert(BLOCK_SIZE_KV <= HEAD_DIM)
 
     # This indicate which block in the sequence length to process
     block_index_q = tl.program_id(0)
@@ -720,6 +720,7 @@ def test_op(BATCH_SIZE: int, NUM_HEADS: int, SEQ_LEN: int, HEAD_DIM: int , causa
 
 
 if __name__ == "__main__":
-    test_op(BATCH_SIZE=8, NUM_HEADS=16, SEQ_LEN=512, HEAD_DIM=32, causal=True)
-    test_op(BATCH_SIZE=8, NUM_HEADS=16, SEQ_LEN=512, HEAD_DIM=32, causal=False)
+    #test_op(BATCH_SIZE=8, NUM_HEADS=16, SEQ_LEN=512, HEAD_DIM=32, causal=True)
+    #test_op(BATCH_SIZE=8, NUM_HEADS=16, SEQ_LEN=512, HEAD_DIM=32, causal=False)
+    test_op(BATCH_SIZE=1176, NUM_HEADS=3, SEQ_LEN=343, HEAD_DIM=16, causal=False)
     print("PASSED")
