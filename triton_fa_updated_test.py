@@ -10,12 +10,16 @@ import triton.language as tl
 
 @triton.jit
 def _attn_fwd(
-    Q,  # [B, H, S, D]
-    K,  # [B, H, S, D]
-    V,  # [B, H, S, D]
+    Q,
+    K,
+    V,
     softmax_scale,
-    M,  # [B, H, S], logsumexp
-    O,  # [B, H, S, D]
+    M,
+    O,
+
+    RPB,     # [H, S, S], dummy [1] if disabled
+    MASK,    # [NW, S, S], dummy [1] if disabled
+
     stride_Q_batch,
     stride_Q_head,
     stride_Q_seq,
@@ -32,12 +36,17 @@ def _attn_fwd(
     stride_O_head,
     stride_O_seq,
     stride_O_dim,
+
     NUM_HEADS: tl.constexpr,
     SEQ_LEN: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     BLOCK_SIZE_Q: tl.constexpr,
     BLOCK_SIZE_KV: tl.constexpr,
     CAUSAL: tl.constexpr,
+
+    NUM_WINDOWS: tl.constexpr,
+    HAS_RPB: tl.constexpr,
+    HAS_MASK: tl.constexpr,
 ):
     block_q = tl.program_id(0)
     batch_head = tl.program_id(1)
@@ -89,6 +98,30 @@ def _attn_fwd(
         )
 
         QK_block = tl.dot(Q_block, K_T_block, input_precision="ieee") * softmax_scale
+
+        if HAS_RPB:
+            rpb_block = tl.load(
+                RPB
+                + head * SEQ_LEN * SEQ_LEN
+                + offs_q[:, None] * SEQ_LEN
+                + offs_kv[None, :],
+                mask=valid_q[:, None] & valid_kv[None, :],
+                other=0.0,
+            )
+            QK_block += rpb_block
+
+        if HAS_MASK:
+            window_index = batch % NUM_WINDOWS
+
+            mask_block = tl.load(
+                MASK
+                + window_index * SEQ_LEN * SEQ_LEN
+                + offs_q[:, None] * SEQ_LEN
+                + offs_kv[None, :],
+                mask=valid_q[:, None] & valid_kv[None, :],
+                other=0.0,
+            )
+            QK_block += mask_block
 
         keep = valid_q[:, None] & valid_kv[None, :]
 
@@ -171,16 +204,25 @@ def _attn_bwd_dq(
     dQ,
     M,
     D,
+
+    RPB,
+    MASK,
+
     stride_batch,
     stride_head,
     stride_seq,
     stride_dim,
+
     NUM_HEADS: tl.constexpr,
     SEQ_LEN: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     BLOCK_Q: tl.constexpr,
     BLOCK_KV: tl.constexpr,
     CAUSAL: tl.constexpr,
+
+    NUM_WINDOWS: tl.constexpr,
+    HAS_RPB: tl.constexpr,
+    HAS_MASK: tl.constexpr,
 ):
     block_q = tl.program_id(0)
     batch_head = tl.program_id(1)
@@ -241,6 +283,29 @@ def _attn_bwd_dq(
 
         QK_block = tl.dot(Q_block, K_T_block, input_precision="ieee") * softmax_scale
 
+        if HAS_RPB:
+            rpb_block = tl.load(
+                RPB
+                + head * SEQ_LEN * SEQ_LEN
+                + offs_q[:, None] * SEQ_LEN
+                + offs_kv[None, :],
+                mask=valid_q[:, None] & valid_kv[None, :],
+                other=0.0,
+            )
+            QK_block += rpb_block
+
+        if HAS_MASK:
+            window_index = batch % NUM_WINDOWS
+
+            mask_block = tl.load(
+                MASK
+                + window_index * SEQ_LEN * SEQ_LEN
+                + offs_q[:, None] * SEQ_LEN
+                + offs_kv[None, :],
+                mask=valid_q[:, None] & valid_kv[None, :],
+                other=0.0,
+            )
+            QK_block += mask_block
 
         keep = valid_q[:, None] & valid_kv[None, :]
 
@@ -274,16 +339,25 @@ def _attn_bwd_dk_dv(
     dV,
     M,
     D,
+
+    RPB,
+    MASK,
+
     stride_batch,
     stride_head,
     stride_seq,
     stride_dim,
+
     NUM_HEADS: tl.constexpr,
     SEQ_LEN: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     BLOCK_Q: tl.constexpr,
     BLOCK_KV: tl.constexpr,
     CAUSAL: tl.constexpr,
+
+    NUM_WINDOWS: tl.constexpr,
+    HAS_RPB: tl.constexpr,
+    HAS_MASK: tl.constexpr,
 ):
     block_kv = tl.program_id(0)
     batch_head = tl.program_id(1)
@@ -345,6 +419,30 @@ def _attn_bwd_dk_dv(
 
         QK_T_block = tl.dot(K_block, Q_T_block, input_precision="ieee") * softmax_scale
 
+        if HAS_RPB:
+            rpb_T_block = tl.load(
+                RPB
+                + head * SEQ_LEN * SEQ_LEN
+                + offs_kv[:, None] * SEQ_LEN
+                + offs_q[None, :],
+                mask=valid_kv[:, None] & valid_q[None, :],
+                other=0.0,
+            )
+            QK_T_block += rpb_T_block
+
+        if HAS_MASK:
+            window_index = batch % NUM_WINDOWS
+
+            mask_T_block = tl.load(
+                MASK
+                + window_index * SEQ_LEN * SEQ_LEN
+                + offs_kv[:, None] * SEQ_LEN
+                + offs_q[None, :],
+                mask=valid_kv[:, None] & valid_q[None, :],
+                other=0.0,
+            )
+            QK_T_block += mask_T_block
+
         keep = valid_kv[:, None] & valid_q[None, :]
 
         if CAUSAL:
@@ -379,12 +477,14 @@ def _attn_bwd_dk_dv(
 class TritonAttention(torch.autograd.Function):
     @staticmethod
     def forward(
-        ctx: Any,
-        Q: torch.Tensor,
-        K: torch.Tensor,
-        V: torch.Tensor,
-        causal: bool,
-        softmax_scale: float,
+            ctx: Any,
+            Q: torch.Tensor,
+            K: torch.Tensor,
+            V: torch.Tensor,
+            RPB: torch.Tensor | None,
+            MASK: torch.Tensor | None,
+            causal: bool,
+            softmax_scale: float,
     ) -> torch.Tensor:
         assert Q.is_cuda and K.is_cuda and V.is_cuda
         assert Q.shape == K.shape == V.shape
@@ -393,6 +493,28 @@ class TritonAttention(torch.autograd.Function):
         assert V.is_contiguous()
 
         BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM = Q.shape
+
+        HAS_RPB = RPB is not None
+        HAS_MASK = MASK is not None
+
+        if HAS_RPB:
+            assert RPB.is_cuda
+            assert RPB.is_contiguous()
+            assert RPB.shape == (NUM_HEADS, SEQ_LEN, SEQ_LEN)
+            assert RPB.dtype == Q.dtype
+        else:
+            RPB = torch.empty((1,), device=Q.device, dtype=Q.dtype)
+
+        if HAS_MASK:
+            assert MASK.is_cuda
+            assert MASK.is_contiguous()
+            assert MASK.shape[-2:] == (SEQ_LEN, SEQ_LEN)
+            assert MASK.dtype == Q.dtype
+            NUM_WINDOWS = MASK.shape[0]
+            assert BATCH_SIZE % NUM_WINDOWS == 0
+        else:
+            MASK = torch.empty((1,), device=Q.device, dtype=Q.dtype)
+            NUM_WINDOWS = 1
 
         O = torch.empty_like(Q)
         M = torch.empty((BATCH_SIZE, NUM_HEADS, SEQ_LEN), device=Q.device, dtype=torch.float32)
@@ -412,6 +534,10 @@ class TritonAttention(torch.autograd.Function):
             softmax_scale,
             M,
             O,
+
+            RPB,
+            MASK,
+
             Q.stride(0),
             Q.stride(1),
             Q.stride(2),
@@ -428,24 +554,33 @@ class TritonAttention(torch.autograd.Function):
             O.stride(1),
             O.stride(2),
             O.stride(3),
+
             NUM_HEADS=NUM_HEADS,
             SEQ_LEN=SEQ_LEN,
             HEAD_DIM=HEAD_DIM,
             BLOCK_SIZE_Q=BLOCK_SIZE_Q,
             BLOCK_SIZE_KV=BLOCK_SIZE_KV,
             CAUSAL=causal,
+
+            NUM_WINDOWS=NUM_WINDOWS,
+            HAS_RPB=HAS_RPB,
+            HAS_MASK=HAS_MASK,
+
             num_warps=4,
-            num_stages=3,
+            num_stages=2,
         )
 
-        ctx.save_for_backward(Q, K, V, O, M)
+        ctx.save_for_backward(Q, K, V, O, M, RPB, MASK)
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
+        ctx.has_rpb = HAS_RPB
+        ctx.has_mask = HAS_MASK
+        ctx.num_windows = NUM_WINDOWS
         return O
 
     @staticmethod
-    def backward(ctx: Any, dO: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, None, None]:
-        Q, K, V, O, M = ctx.saved_tensors
+    def backward(ctx: Any, dO: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, None, None, None, None]:
+        Q, K, V, O, M, RPB, MASK = ctx.saved_tensors
 
         dO = dO.contiguous()
 
@@ -479,7 +614,7 @@ class TritonAttention(torch.autograd.Function):
             HEAD_DIM=HEAD_DIM,
             BLOCK_SIZE_Q=BLOCK_Q,
             num_warps=4,
-            num_stages=3,
+            num_stages=2,
         )
 
         grid_q = (
@@ -496,20 +631,29 @@ class TritonAttention(torch.autograd.Function):
             dQ,
             M,
             D,
+
+            RPB,
+            MASK,
+
             Q.stride(0),
             Q.stride(1),
             Q.stride(2),
             Q.stride(3),
+
             NUM_HEADS=NUM_HEADS,
             SEQ_LEN=SEQ_LEN,
             HEAD_DIM=HEAD_DIM,
             BLOCK_Q=BLOCK_Q,
             BLOCK_KV=BLOCK_KV,
             CAUSAL=ctx.causal,
-            num_warps=4,
-            num_stages=3,
-        )
 
+            NUM_WINDOWS=ctx.num_windows,
+            HAS_RPB=ctx.has_rpb,
+            HAS_MASK=ctx.has_mask,
+
+            num_warps=4,
+            num_stages=2,
+        )
         grid_kv = (
             triton.cdiv(SEQ_LEN, BLOCK_KV),
             BATCH_SIZE * NUM_HEADS,
@@ -525,21 +669,31 @@ class TritonAttention(torch.autograd.Function):
             dV,
             M,
             D,
+
+            RPB,
+            MASK,
+
             Q.stride(0),
             Q.stride(1),
             Q.stride(2),
             Q.stride(3),
+
             NUM_HEADS=NUM_HEADS,
             SEQ_LEN=SEQ_LEN,
             HEAD_DIM=HEAD_DIM,
             BLOCK_Q=BLOCK_Q,
             BLOCK_KV=BLOCK_KV,
             CAUSAL=ctx.causal,
+
+            NUM_WINDOWS=ctx.num_windows,
+            HAS_RPB=ctx.has_rpb,
+            HAS_MASK=ctx.has_mask,
+
             num_warps=4,
-            num_stages=3,
+            num_stages=2,
         )
 
-        return dQ, dK, dV, None, None
+        return dQ, dK, dV, None, None, None, None
 
 
 def torch_attention_ref(
