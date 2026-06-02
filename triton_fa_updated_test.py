@@ -6,7 +6,7 @@ import torch
 import triton
 import triton.language as tl
 
-
+# GOLD VERSION
 
 @triton.jit
 def _attn_fwd(
