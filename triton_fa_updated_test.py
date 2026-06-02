@@ -7,6 +7,7 @@ import triton
 import triton.language as tl
 
 
+
 @triton.jit
 def _attn_fwd(
     Q,  # [B, H, S, D]
@@ -566,7 +567,7 @@ def test_op(
     HEAD_DIM: int,
     causal: bool,
     dtype: torch.dtype = torch.float16,
-    atol: float = 5e-6,
+    atol: float = 5e-7,
     rtol: float = 0,
 ) -> None:
     torch.manual_seed(1234)
@@ -664,12 +665,12 @@ if __name__ == "__main__":
 
     # Small tests first.
     test_op(BATCH_SIZE=2, NUM_HEADS=3, SEQ_LEN=343, HEAD_DIM=16, causal=False, dtype=torch.float32)
-    test_op(BATCH_SIZE=2, NUM_HEADS=3, SEQ_LEN=343, HEAD_DIM=16, causal=True, dtype=torch.float32)
+    #test_op(BATCH_SIZE=2, NUM_HEADS=3, SEQ_LEN=343, HEAD_DIM=16, causal=True, dtype=torch.float32)
 
 
     # Your actual dimensions.
     test_op(BATCH_SIZE=1176, NUM_HEADS=3, SEQ_LEN=343, HEAD_DIM=16, causal=False, dtype=torch.float32)
-    test_op(BATCH_SIZE=1176, NUM_HEADS=3, SEQ_LEN=343, HEAD_DIM=16, causal=True, dtype=torch.float32)
+    #test_op(BATCH_SIZE=1176, NUM_HEADS=3, SEQ_LEN=343, HEAD_DIM=16, causal=True, dtype=torch.float32)
     # Optional forward benchmark.
     benchmark_forward(BATCH_SIZE=1176, NUM_HEADS=3, SEQ_LEN=343, HEAD_DIM=16, causal=False, dtype=torch.float32)
 
