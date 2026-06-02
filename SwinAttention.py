@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from monai.networks.nets.swin_unetr import WindowAttention as OrigWindowAttention
 import numpy as np
 import random
-
+from triton_fa_updated_test import TritonAttention
 SEED = 1234
 
 def _no_grad_trunc_normal_(tensor, mean, std, a, b):
@@ -218,10 +218,10 @@ class WindowAttention(nn.Module):
         )
 
         # Section 2, scale and Q@K.T
-        attn = record_section(
-            "Section 2, scale and Q@K.T",
-            lambda: (q * self.scale) @ k.transpose(-2, -1),
-        )
+        # attn = record_section(
+        #     "Section 2, scale and Q@K.T",
+        #     lambda: (q * self.scale) @ k.transpose(-2, -1),
+        # )
 
         # Section 3, relative position bias
         relative_position_bias = record_section(
@@ -231,51 +231,56 @@ class WindowAttention(nn.Module):
             ]
             .reshape(n, n, -1)
             .permute(2, 0, 1)
-            .contiguous(),
+            .contiguous().to(dtype=q.dtype)
         )
+        if mask is not None:
+            mask = mask.contiguous().to(dtype=q.dtype)
 
-        # Section 4, apply RPB to attention
-        attn = record_section(
-            "Section 4, apply RPB to attention",
-            lambda: attn.add_(relative_position_bias.unsqueeze(0))
-        )
-
-        # Section 5, add mask
-        def add_mask():
-            if mask is None:
-                return attn
-
-            nw = mask.shape[0]
-            masked_attn = attn.view(
-                b // nw, nw, self.num_heads, n, n
-            ) + mask.unsqueeze(1).unsqueeze(0)
-
-            return masked_attn.view(-1, self.num_heads, n, n)
-
-        attn = record_section("Section 5, add mask", add_mask)
-
-        # Section 6, apply softmax
-        attn = record_section(
-            "Section 6, apply softmax",
-            lambda: self.softmax(attn),
-        )
+        attn = TritonAttention.apply(q.contiguous(), k.contiguous(), v.contiguous(), relative_position_bias, mask, False, self.scale).transpose(1, 2).reshape(b, n, c)
+        # # Section 4, apply RPB to attention
+        # attn = record_section(
+        #     "Section 4, apply RPB to attention",
+        #     lambda: attn.add_(relative_position_bias.unsqueeze(0))
+        # )
+        #
+        #
+        # # Section 5, add mask
+        # def add_mask():
+        #     if mask is None:
+        #         return attn
+        #
+        #
+        #     nw = mask.shape[0]
+        #     masked_attn = attn.view(
+        #         b // nw, nw, self.num_heads, n, n
+        #     ) + mask.unsqueeze(1).unsqueeze(0)
+        #
+        #     return masked_attn.view(-1, self.num_heads, n, n)
+        #
+        # attn = record_section("Section 5, add mask", add_mask)
+        #
+        # # Section 6, apply softmax
+        # attn = record_section(
+        #     "Section 6, apply softmax",
+        #     lambda: self.softmax(attn),
+        # )
 
         # Section 7, apply dropout and cast
-        attn = record_section(
-            "Section 7, apply dropout and cast",
-            lambda: self.attn_drop(attn).to(v.dtype),
-        )
-
-        # Section 8, matmul by V
-        x = record_section(
-            "Section 8, matmul by V",
-            lambda: (attn @ v).transpose(1, 2).reshape(b, n, c),
-        )
+        # attn = record_section(
+        #     "Section 7, apply dropout and cast",
+        #     lambda: self.attn_drop(attn).to(v.dtype),
+        # )
+        #
+        # # Section 8, matmul by V
+        # x = record_section(
+        #     "Section 8, matmul by V",
+        #     lambda: (attn @ v).transpose(1, 2).reshape(b, n, c),
+        # )
 
         # Section 9, projection and dropout
         x = record_section(
             "Section 9, projection and dropout",
-            lambda: self.proj_drop(self.proj(x)),
+            lambda: self.proj_drop(self.proj(attn)),
         )
 
         if profile_sections and x.is_cuda:
@@ -361,14 +366,14 @@ if __name__ == "__main__":
     with torch.inference_mode():
         restore_rng_state()
         out1 = win1(x, mask)
-        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cuda.matmul.allow_tf32 = False
         torch.set_float32_matmul_precision("highest")
         restore_rng_state()
         out0 = win0(x, mask)
 
 
 
-    print(torch.allclose(out0, out1, atol=1e-5, rtol=1e-5))
+    print(torch.allclose(out0, out1, atol=1e-5, rtol=0))
 
     section_times = profile_window_attention_sections(
         win0,
