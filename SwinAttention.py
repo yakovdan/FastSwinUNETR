@@ -336,8 +336,7 @@ def profile_window_attention_sections(
     }
 
 if __name__ == "__main__":
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.set_float32_matmul_precision("high")
+
     # ----------------------------
     # Reproducibility
     # ----------------------------
@@ -361,12 +360,15 @@ if __name__ == "__main__":
 
     with torch.inference_mode():
         restore_rng_state()
+        out1 = win1(x, mask)
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.set_float32_matmul_precision("highest")
+        restore_rng_state()
         out0 = win0(x, mask)
 
-        restore_rng_state()
-        out1 = win1(x, mask)
 
-    print(torch.allclose(out0, out1, atol=1e-4, rtol=1e-4))
+
+    print(torch.allclose(out0, out1, atol=1e-5, rtol=1e-5))
 
     section_times = profile_window_attention_sections(
         win0,
