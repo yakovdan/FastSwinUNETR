@@ -1,5 +1,6 @@
 from __future__ import annotations
 from collections.abc import Sequence
+import time
 import torch
 from torch import nn
 import math
@@ -59,6 +60,11 @@ def trunc_normal_(tensor, mean=0.0, std=1.0, a=-2.0, b=2.0):
         raise ValueError("minimum cutoff value (a) should be smaller than maximum cutoff value (b).")
 
     return _no_grad_trunc_normal_(tensor, mean, std, a, b)
+
+def make_event_pair():
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    return start, end
 
 
 class WindowAttention(nn.Module):
@@ -144,30 +150,141 @@ class WindowAttention(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
         trunc_normal_(self.relative_position_bias_table, std=0.02)
         self.softmax = nn.Softmax(dim=-1)
+        self.profile_sections = False
+        self.last_section_times_ms: dict[str, float] = {}
 
-    def forward(self, x, mask):
+    def section_profile_lines(self) -> list[str]:
+        total_ms = sum(self.last_section_times_ms.values())
+        lines: list[str] = []
+        for section_name, elapsed_ms in self.last_section_times_ms.items():
+            percentage = (elapsed_ms / total_ms * 100.0) if total_ms > 0.0 else 0.0
+            lines.append(f"{section_name}: {elapsed_ms:.3f} ms ({percentage:.1f}%)")
+
+        if self.last_section_times_ms:
+            slowest_section_name, slowest_elapsed_ms = max(
+                self.last_section_times_ms.items(),
+                key=lambda section_time: section_time[1],
+            )
+            slowest_percentage = (slowest_elapsed_ms / total_ms * 100.0) if total_ms > 0.0 else 0.0
+            lines.append(
+                "Summary: "
+                f"total={total_ms:.3f} ms, "
+                f"sections={len(self.last_section_times_ms)}, "
+                f"slowest={slowest_section_name} "
+                f"({slowest_elapsed_ms:.3f} ms, {slowest_percentage:.1f}%)"
+            )
+
+        return lines
+
+
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
         b, n, c = x.shape
-        qkv = self.qkv(x).reshape(b, n, 3, self.num_heads, c // self.num_heads).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
-        q = q * self.scale
-        attn = q @ k.transpose(-2, -1)
-        relative_position_bias = self.relative_position_bias_table[
-            self.relative_position_index.clone()[:n, :n].reshape(-1)  # type: ignore[operator]
-        ].reshape(n, n, -1)
-        relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()
-        attn = attn + relative_position_bias.unsqueeze(0)
-        if mask is not None:
-            nw = mask.shape[0]
-            attn = attn.view(b // nw, nw, self.num_heads, n, n) + mask.unsqueeze(1).unsqueeze(0)
-            attn = attn.view(-1, self.num_heads, n, n)
-            attn = self.softmax(attn)
-        else:
-            attn = self.softmax(attn)
 
-        attn = self.attn_drop(attn).to(v.dtype)
-        x = (attn @ v).transpose(1, 2).reshape(b, n, c)
-        x = self.proj(x)
-        x = self.proj_drop(x)
+        profile_sections = self.profile_sections
+        self.last_section_times_ms = {}
+
+        section_events: dict[str, tuple[torch.cuda.Event, torch.cuda.Event]] = {}
+
+        def record_section(section_name: str, fn):
+            if not profile_sections:
+                return fn()
+
+            if not x.is_cuda:
+                section_start = time.perf_counter()
+                result = fn()
+                self.last_section_times_ms[section_name] = (
+                                                                   time.perf_counter() - section_start
+                                                           ) * 1000.0
+                return result
+
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+
+            start.record()
+            result = fn()
+            end.record()
+
+            section_events[section_name] = (start, end)
+            return result
+
+        # Section 1, projection
+        q, k, v = record_section(
+            "Section 1, projection",
+            lambda: self.qkv(x)
+            .reshape(b, n, 3, self.num_heads, c // self.num_heads)
+            .permute(2, 0, 3, 1, 4)
+            .unbind(0),
+        )
+
+        # Section 2, scale and Q@K.T
+        attn = record_section(
+            "Section 2, scale and Q@K.T",
+            lambda: (q * self.scale) @ k.transpose(-2, -1),
+        )
+
+        # Section 3, relative position bias
+        relative_position_bias = record_section(
+            "Section 3, relative position bias",
+            lambda: self.relative_position_bias_table[
+                self.relative_position_index.clone()[:n, :n].reshape(-1)
+            ]
+            .reshape(n, n, -1)
+            .permute(2, 0, 1)
+            .contiguous(),
+        )
+
+        # Section 4, apply RPB to attention
+        attn = record_section(
+            "Section 4, apply RPB to attention",
+            lambda: attn.add_(relative_position_bias.unsqueeze(0))
+        )
+
+        # Section 5, add mask
+        def add_mask():
+            if mask is None:
+                return attn
+
+            nw = mask.shape[0]
+            masked_attn = attn.view(
+                b // nw, nw, self.num_heads, n, n
+            ) + mask.unsqueeze(1).unsqueeze(0)
+
+            return masked_attn.view(-1, self.num_heads, n, n)
+
+        attn = record_section("Section 5, add mask", add_mask)
+
+        # Section 6, apply softmax
+        attn = record_section(
+            "Section 6, apply softmax",
+            lambda: self.softmax(attn),
+        )
+
+        # Section 7, apply dropout and cast
+        attn = record_section(
+            "Section 7, apply dropout and cast",
+            lambda: self.attn_drop(attn).to(v.dtype),
+        )
+
+        # Section 8, matmul by V
+        x = record_section(
+            "Section 8, matmul by V",
+            lambda: (attn @ v).transpose(1, 2).reshape(b, n, c),
+        )
+
+        # Section 9, projection and dropout
+        x = record_section(
+            "Section 9, projection and dropout",
+            lambda: self.proj_drop(self.proj(x)),
+        )
+
+        if profile_sections and x.is_cuda:
+            torch.cuda.synchronize(x.device)
+            self.last_section_times_ms = {
+                section_name: start.elapsed_time(end)
+                for section_name, (start, end) in section_events.items()
+            }
+
         return x
 
 
@@ -178,8 +295,49 @@ def restore_rng_state() -> None:
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(SEED)
 
-if __name__ == "__main__":
+from collections import defaultdict
 
+def profile_window_attention_sections(
+    module: WindowAttention,
+    x: torch.Tensor,
+    mask: torch.Tensor | None,
+    warmup_iters: int = 25,
+    profile_iters: int = 50,
+) -> dict[str, float]:
+    module.eval()
+
+    # Warmup without section profiling.
+    module.profile_sections = False
+
+    with torch.inference_mode():
+        for _ in range(warmup_iters):
+            _ = module(x, mask)
+
+    torch.cuda.synchronize(x.device)
+
+    accumulated_ms: dict[str, float] = defaultdict(float)
+
+    module.profile_sections = True
+
+    with torch.inference_mode():
+        for _ in range(profile_iters):
+            _ = module(x, mask)
+
+            for section_name, elapsed_ms in module.last_section_times_ms.items():
+                accumulated_ms[section_name] += elapsed_ms
+
+    torch.cuda.synchronize(x.device)
+
+    module.profile_sections = False
+
+    return {
+        section_name: total_ms / profile_iters
+        for section_name, total_ms in accumulated_ms.items()
+    }
+
+if __name__ == "__main__":
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
     # ----------------------------
     # Reproducibility
     # ----------------------------
@@ -189,15 +347,39 @@ if __name__ == "__main__":
 
     restore_rng_state()
     win0 = WindowAttention(48, 3, (7, 7, 7), True, 0.25, 0.25).to("cuda").to(dtype)
+    win0.profile_sections = True
 
     restore_rng_state()
     win1 = OrigWindowAttention(48, 3, (7, 7, 7), True, 0.25, 0.25).to("cuda").to(dtype)
 
     win0.eval()
     win1.eval()
+    # ----------------------------
+    # Correctness check
+    # ----------------------------
+    win0.profile_sections = False
+
     with torch.inference_mode():
         restore_rng_state()
         out0 = win0(x, mask)
+
         restore_rng_state()
         out1 = win1(x, mask)
+
     print(torch.allclose(out0, out1, atol=1e-4, rtol=1e-4))
+
+    section_times = profile_window_attention_sections(
+        win0,
+        x,
+        mask,
+        warmup_iters=25,
+        profile_iters=50,
+    )
+
+    total_ms = sum(section_times.values())
+
+    for section_name, elapsed_ms in section_times.items():
+        percentage = elapsed_ms / total_ms * 100.0
+        print(f"{section_name}: {elapsed_ms:.3f} ms ({percentage:.1f}%)")
+
+    print(f"Total: {total_ms:.3f} ms")
