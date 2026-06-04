@@ -723,6 +723,7 @@ def test_op(
     dtype: torch.dtype = torch.float16,
     atol: float = 5e-7,
     rtol: float = 0,
+    window_size: int = 7,
 ) -> None:
     torch.manual_seed(1234)
     torch.cuda.manual_seed_all(1234)
@@ -814,6 +815,10 @@ def benchmark_forward(
 
 
 if __name__ == "__main__":
+    x0 = torch.load('sw_input0.pt')
+    x1 = torch.load('sw_input1.pt')
+    m1 = torch.load('sw_input1_mask.pt')
+
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.set_float32_matmul_precision("highest")
 

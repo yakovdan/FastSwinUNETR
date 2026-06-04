@@ -4,13 +4,8 @@ import time
 import torch
 from torch import nn
 import math
-from torch.nn.attention import SDPBackend, sdpa_kernel
-import torch.nn.functional as F
-from monai.networks.nets.swin_unetr import WindowAttention as OrigWindowAttention
-import numpy as np
-import random
 from triton_fa_updated_test import TritonAttention
-SEED = 1234
+
 
 def _no_grad_trunc_normal_(tensor, mean, std, a, b):
     """Tensor initialization with truncated normal distribution.
@@ -67,7 +62,7 @@ def make_event_pair():
     return start, end
 
 
-class WindowAttention(nn.Module):
+class FastWindowAttention(nn.Module):
     """
     Window based multi-head self attention module with relative position bias based on: "Liu et al.,
     Swin Transformer: Hierarchical Vision Transformer using Shifted Windows
@@ -178,7 +173,7 @@ class WindowAttention(nn.Module):
 
 
 
-    def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         b, n, c = x.shape
 
         profile_sections = self.profile_sections
@@ -290,103 +285,10 @@ class WindowAttention(nn.Module):
                 for section_name, (start, end) in section_events.items()
             }
 
-        return x
-
-
-def restore_rng_state() -> None:
-    random.seed(SEED)
-    np.random.seed(SEED)
-    torch.manual_seed(SEED)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(SEED)
-
-from collections import defaultdict
-
-def profile_window_attention_sections(
-    module: WindowAttention,
-    x: torch.Tensor,
-    mask: torch.Tensor | None,
-    warmup_iters: int = 25,
-    profile_iters: int = 50,
-) -> dict[str, float]:
-    module.eval()
-
-    # Warmup without section profiling.
-    module.profile_sections = False
-
-    with torch.inference_mode():
-        for _ in range(warmup_iters):
-            _ = module(x, mask)
-
-    torch.cuda.synchronize(x.device)
-
-    accumulated_ms: dict[str, float] = defaultdict(float)
-
-    module.profile_sections = True
-
-    with torch.inference_mode():
-        for _ in range(profile_iters):
-            _ = module(x, mask)
-
-            for section_name, elapsed_ms in module.last_section_times_ms.items():
-                accumulated_ms[section_name] += elapsed_ms
-
-    torch.cuda.synchronize(x.device)
-
-    module.profile_sections = False
-
-    return {
-        section_name: total_ms / profile_iters
-        for section_name, total_ms in accumulated_ms.items()
-    }
-
-if __name__ == "__main__":
-
-    # ----------------------------
-    # Reproducibility
-    # ----------------------------
-    dtype = torch.float32
-    x = torch.load('input_tensor.pt').to("cuda").to(dtype)
-    mask = torch.load('mask_tensor.pt').to("cuda").to(dtype)
-
-    restore_rng_state()
-    win0 = WindowAttention(48, 3, (7, 7, 7), True, 0.25, 0.25).to("cuda").to(dtype)
-    win0.profile_sections = True
-
-    restore_rng_state()
-    win1 = OrigWindowAttention(48, 3, (7, 7, 7), True, 0.25, 0.25).to("cuda").to(dtype)
-
-    win0.eval()
-    win1.eval()
-    # ----------------------------
-    # Correctness check
-    # ----------------------------
-    win0.profile_sections = False
-
-    with torch.inference_mode():
-        restore_rng_state()
-        out1 = win1(x, mask)
-        torch.backends.cuda.matmul.allow_tf32 = False
-        torch.set_float32_matmul_precision("highest")
-        restore_rng_state()
-        out0 = win0(x, mask)
+        return x, q, k, v, relative_position_bias
 
 
 
-    print(torch.allclose(out0, out1, atol=1e-5, rtol=0))
 
-    section_times = profile_window_attention_sections(
-        win0,
-        x,
-        mask,
-        warmup_iters=25,
-        profile_iters=50,
-    )
 
-    total_ms = sum(section_times.values())
 
-    for section_name, elapsed_ms in section_times.items():
-        percentage = elapsed_ms / total_ms * 100.0
-        print(f"{section_name}: {elapsed_ms:.3f} ms ({percentage:.1f}%)")
-
-    print(f"Total: {total_ms:.3f} ms")
