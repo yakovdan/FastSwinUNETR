@@ -60,7 +60,7 @@ def profile_original_window_attention_backward(
         x_tmp = x_base.clone().requires_grad_(True)
         out_tmp = module(x_tmp, mask)
         if isinstance(out_tmp, tuple):
-            out_tmp = out_tmput[0]
+            out_tmp = out_tmp[0]
         d_out = torch.randn_like(out_tmp)
 
     torch.cuda.synchronize(x.device)
