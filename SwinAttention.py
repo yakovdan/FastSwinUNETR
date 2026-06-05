@@ -231,7 +231,7 @@ class FastWindowAttention(nn.Module):
         if mask is not None:
             mask = mask.contiguous().to(dtype=q.dtype)
 
-        attn = TritonAttention.apply(q.contiguous(), k.contiguous(), v.contiguous(), relative_position_bias, mask, False, self.scale).transpose(1, 2).reshape(b, n, c)
+        attn = TritonAttention.apply(q.contiguous(), k.contiguous(), v.contiguous(), relative_position_bias, mask, self.scale).transpose(1, 2).reshape(b, n, c)
         # # Section 4, apply RPB to attention
         # attn = record_section(
         #     "Section 4, apply RPB to attention",
