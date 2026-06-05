@@ -150,6 +150,27 @@ def _attn_fwd(
     )
 
 
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {"BLOCK_SIZE_Q": 32},
+            num_warps=1,
+            num_stages=2,
+        ),
+        triton.Config(
+            {"BLOCK_SIZE_Q": 64},
+            num_warps=2,
+            num_stages=2,
+        ),
+        triton.Config(
+            {"BLOCK_SIZE_Q": 128},
+            num_warps=4,
+            num_stages=2,
+        ),
+    ],
+    key=["SEQ_LEN", "HEAD_DIM"],
+)
+
 @triton.jit
 def _attn_bwd_preprocess(
     O,
@@ -187,6 +208,47 @@ def _attn_bwd_preprocess(
         mask=valid_q,
     )
 
+
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {"BLOCK_Q": 32, "BLOCK_KV": 32},
+            num_warps=2,
+            num_stages=2,
+        ),
+        triton.Config(
+            {"BLOCK_Q": 32, "BLOCK_KV": 64},
+            num_warps=4,
+            num_stages=2,
+        ),
+        triton.Config(
+            {"BLOCK_Q": 64, "BLOCK_KV": 32},
+            num_warps=4,
+            num_stages=2,
+        ),
+        triton.Config(
+            {"BLOCK_Q": 64, "BLOCK_KV": 64},
+            num_warps=4,
+            num_stages=2,
+        ),
+        triton.Config(
+            {"BLOCK_Q": 64, "BLOCK_KV": 128},
+            num_warps=4,
+            num_stages=2,
+        ),
+        triton.Config(
+            {"BLOCK_Q": 128, "BLOCK_KV": 32},
+            num_warps=4,
+            num_stages=2,
+        ),
+        triton.Config(
+            {"BLOCK_Q": 128, "BLOCK_KV": 64},
+            num_warps=4,
+            num_stages=2,
+        ),
+    ],
+    key=["SEQ_LEN", "HEAD_DIM", "HAS_MASK"],
+)
 
 @triton.jit
 def _attn_bwd_dq(
@@ -315,6 +377,42 @@ def _attn_bwd_dq(
         mask=valid_q[:, None],
     )
 
+
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {"BLOCK_Q": 32, "BLOCK_KV": 32},
+            num_warps=2,
+            num_stages=2,
+        ),
+        triton.Config(
+            {"BLOCK_Q": 64, "BLOCK_KV": 32},
+            num_warps=4,
+            num_stages=2,
+        ),
+        triton.Config(
+            {"BLOCK_Q": 32, "BLOCK_KV": 64},
+            num_warps=4,
+            num_stages=2,
+        ),
+        triton.Config(
+            {"BLOCK_Q": 64, "BLOCK_KV": 64},
+            num_warps=4,
+            num_stages=2,
+        ),
+        triton.Config(
+            {"BLOCK_Q": 128, "BLOCK_KV": 32},
+            num_warps=4,
+            num_stages=2,
+        ),
+        triton.Config(
+            {"BLOCK_Q": 128, "BLOCK_KV": 64},
+            num_warps=4,
+            num_stages=2,
+        ),
+    ],
+    key=["SEQ_LEN", "HEAD_DIM", "HAS_MASK"],
+)
 
 @triton.jit
 def _attn_bwd_dk_dv(
@@ -592,13 +690,28 @@ class TritonAttention(torch.autograd.Function):
 
         D = torch.empty_like(M)
 
-        BLOCK_Q = 64
-        BLOCK_KV = 64
+        # BLOCK_Q = 64
+        # BLOCK_KV = 64
 
-        preprocess_grid = (
-            triton.cdiv(SEQ_LEN, BLOCK_Q),
+        preprocess_grid = lambda args: (
+            triton.cdiv(SEQ_LEN, args["BLOCK_SIZE_Q"]),
             BATCH_SIZE * NUM_HEADS,
         )
+
+        grid_q = lambda args: (
+            triton.cdiv(SEQ_LEN, args["BLOCK_Q"]),
+            BATCH_SIZE * NUM_HEADS,
+        )
+
+        grid_kv = lambda args: (
+            triton.cdiv(SEQ_LEN, args["BLOCK_KV"]),
+            BATCH_SIZE * NUM_HEADS,
+        )
+
+        # preprocess_grid = (
+        #     triton.cdiv(SEQ_LEN, BLOCK_Q),
+        #     BATCH_SIZE * NUM_HEADS,
+        # )
 
         _attn_bwd_preprocess[preprocess_grid](
             O,
@@ -606,15 +719,14 @@ class TritonAttention(torch.autograd.Function):
             D,
             SEQ_LEN=SEQ_LEN,
             HEAD_DIM=HEAD_DIM,
-            BLOCK_SIZE_Q=BLOCK_Q,
-            num_warps=4,
-            num_stages=2,
+
         )
 
-        grid_q = (
-            triton.cdiv(SEQ_LEN, BLOCK_Q),
-            BATCH_SIZE * NUM_HEADS,
-        )
+
+        # grid_q = (
+        #     triton.cdiv(SEQ_LEN, BLOCK_Q),
+        #     BATCH_SIZE * NUM_HEADS,
+        # )
 
         _attn_bwd_dq[grid_q](
             Q,
@@ -637,19 +749,15 @@ class TritonAttention(torch.autograd.Function):
             NUM_HEADS=NUM_HEADS,
             SEQ_LEN=SEQ_LEN,
             HEAD_DIM=HEAD_DIM,
-            BLOCK_Q=BLOCK_Q,
-            BLOCK_KV=BLOCK_KV,
 
             NUM_WINDOWS=ctx.num_windows,
             HAS_MASK=ctx.has_mask,
+        )
 
-            num_warps=4,
-            num_stages=2,
-        )
-        grid_kv = (
-            triton.cdiv(SEQ_LEN, BLOCK_KV),
-            BATCH_SIZE * NUM_HEADS,
-        )
+        # grid_kv = (
+        #     triton.cdiv(SEQ_LEN, BLOCK_KV),
+        #     BATCH_SIZE * NUM_HEADS,
+        # )
 
         _attn_bwd_dk_dv[grid_kv](
             Q,
@@ -674,14 +782,8 @@ class TritonAttention(torch.autograd.Function):
             NUM_HEADS=NUM_HEADS,
             SEQ_LEN=SEQ_LEN,
             HEAD_DIM=HEAD_DIM,
-            BLOCK_Q=BLOCK_Q,
-            BLOCK_KV=BLOCK_KV,
-
             NUM_WINDOWS=ctx.num_windows,
             HAS_MASK=ctx.has_mask,
-
-            num_warps=4,
-            num_stages=2,
         )
 
         return dQ, dK, dV, dRPB, None, None, None
