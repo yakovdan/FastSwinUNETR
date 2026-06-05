@@ -42,7 +42,6 @@ def _attn_fwd(
     HEAD_DIM: tl.constexpr,
     BLOCK_SIZE_Q: tl.constexpr,
     BLOCK_SIZE_KV: tl.constexpr,
-    CAUSAL: tl.constexpr,
 
     NUM_WINDOWS: tl.constexpr,
     HAS_MASK: tl.constexpr,
@@ -122,9 +121,6 @@ def _attn_fwd(
             QK_block += mask_block
 
         keep = valid_q[:, None] & valid_kv[None, :]
-
-        if CAUSAL:
-            keep = keep & (offs_q[:, None] >= offs_kv[None, :])
 
         QK_block = tl.where(keep, QK_block, -1.0e20)
 
@@ -216,7 +212,6 @@ def _attn_bwd_dq(
     HEAD_DIM: tl.constexpr,
     BLOCK_Q: tl.constexpr,
     BLOCK_KV: tl.constexpr,
-    CAUSAL: tl.constexpr,
 
     NUM_WINDOWS: tl.constexpr,
     HAS_MASK: tl.constexpr,
@@ -305,9 +300,6 @@ def _attn_bwd_dq(
 
         keep = valid_q[:, None] & valid_kv[None, :]
 
-        if CAUSAL:
-            keep = keep & (offs_q[:, None] >= offs_kv[None, :])
-
         QK_block = tl.where(keep, QK_block, -1.0e20)
         P_block = tl.exp(QK_block - M_block)
         P_block = tl.where(keep, P_block, 0.0)
@@ -350,7 +342,6 @@ def _attn_bwd_dk_dv(
     HEAD_DIM: tl.constexpr,
     BLOCK_Q: tl.constexpr,
     BLOCK_KV: tl.constexpr,
-    CAUSAL: tl.constexpr,
 
     NUM_WINDOWS: tl.constexpr,
     HAS_MASK: tl.constexpr,
@@ -443,10 +434,6 @@ def _attn_bwd_dk_dv(
 
         keep = valid_kv[:, None] & valid_q[None, :]
 
-        if CAUSAL:
-            # P_T_block is [key, query], allowed iff key <= query.
-            keep = keep & (offs_q[None, :] >= offs_kv[:, None])
-
         QK_T_block = tl.where(keep, QK_T_block, -1.0e20)
         P_T_block = tl.exp(QK_T_block - M_block[None, :])
         P_T_block = tl.where(keep, P_T_block, 0.0)
@@ -495,7 +482,6 @@ class TritonAttention(torch.autograd.Function):
             V: torch.Tensor,
             RPB: torch.Tensor,
             MASK: torch.Tensor | None,
-            causal: bool,
             softmax_scale: float,
     ) -> torch.Tensor:
         assert Q.is_cuda and K.is_cuda and V.is_cuda
@@ -568,7 +554,6 @@ class TritonAttention(torch.autograd.Function):
             HEAD_DIM=HEAD_DIM,
             BLOCK_SIZE_Q=BLOCK_SIZE_Q,
             BLOCK_SIZE_KV=BLOCK_SIZE_KV,
-            CAUSAL=causal,
 
             NUM_WINDOWS=NUM_WINDOWS,
             HAS_MASK=HAS_MASK,
@@ -579,7 +564,6 @@ class TritonAttention(torch.autograd.Function):
 
         ctx.save_for_backward(Q, K, V, O, M, RPB, MASK)
         ctx.softmax_scale = softmax_scale
-        ctx.causal = causal
         ctx.has_mask = HAS_MASK
         ctx.num_windows = NUM_WINDOWS
         return O
@@ -655,7 +639,6 @@ class TritonAttention(torch.autograd.Function):
             HEAD_DIM=HEAD_DIM,
             BLOCK_Q=BLOCK_Q,
             BLOCK_KV=BLOCK_KV,
-            CAUSAL=ctx.causal,
 
             NUM_WINDOWS=ctx.num_windows,
             HAS_MASK=ctx.has_mask,
@@ -693,7 +676,6 @@ class TritonAttention(torch.autograd.Function):
             HEAD_DIM=HEAD_DIM,
             BLOCK_Q=BLOCK_Q,
             BLOCK_KV=BLOCK_KV,
-            CAUSAL=ctx.causal,
 
             NUM_WINDOWS=ctx.num_windows,
             HAS_MASK=ctx.has_mask,
@@ -709,15 +691,9 @@ def torch_attention_ref(
     Q: torch.Tensor,
     K: torch.Tensor,
     V: torch.Tensor,
-    causal: bool,
     softmax_scale: float,
 ) -> torch.Tensor:
     P = torch.matmul(Q, K.transpose(-2, -1)) * softmax_scale
-
-    if causal:
-        seq_len = Q.shape[-2]
-        causal_mask = torch.tril(torch.ones((seq_len, seq_len), device=Q.device, dtype=torch.bool))
-        P = P.masked_fill(~causal_mask, float("-inf"))
 
     P = torch.softmax(P.float(), dim=-1).to(Q.dtype)
     return torch.matmul(P, V)
@@ -728,7 +704,6 @@ def test_op(
     NUM_HEADS: int,
     SEQ_LEN: int,
     HEAD_DIM: int,
-    causal: bool,
     dtype: torch.dtype = torch.float16,
     atol: float = 5e-7,
     rtol: float = 0,
@@ -749,7 +724,7 @@ def test_op(
     dO = torch.randn_like(Q)
     softmax_scale = HEAD_DIM ** -0.5
 
-    ref_O = torch_attention_ref(Q, K, V, causal, softmax_scale)
+    ref_O = torch_attention_ref(Q, K, V, softmax_scale)
     ref_O.backward(dO)
 
     ref_dQ = Q.grad.detach().clone()
@@ -760,7 +735,7 @@ def test_op(
     K.grad = None
     V.grad = None
 
-    tri_O = TritonAttention.apply(Q, K, V, causal, softmax_scale)
+    tri_O = TritonAttention.apply(Q, K, V, softmax_scale)
     tri_O.backward(dO)
 
     tri_dQ = Q.grad.detach().clone()
@@ -771,7 +746,7 @@ def test_op(
 
     print(
         f"test B={BATCH_SIZE}, H={NUM_HEADS}, S={SEQ_LEN}, D={HEAD_DIM}, "
-        f"causal={causal}, dtype={dtype}"
+        f"dtype={dtype}"
     )
 
     print("O max abs diff: ", (ref_O - tri_O).abs().max().item())
@@ -790,7 +765,6 @@ def benchmark_forward(
     NUM_HEADS: int,
     SEQ_LEN: int,
     HEAD_DIM: int,
-    causal: bool,
     dtype: torch.dtype = torch.float16,
     warmup: int = 25,
     iters: int = 100,
@@ -802,7 +776,7 @@ def benchmark_forward(
 
     with torch.inference_mode():
         for _ in range(warmup):
-            _ = TritonAttention.apply(Q, K, V, causal, softmax_scale)
+            _ = TritonAttention.apply(Q, K, V, softmax_scale)
 
     torch.cuda.synchronize()
 
@@ -812,14 +786,14 @@ def benchmark_forward(
     with torch.inference_mode():
         start.record()
         for _ in range(iters):
-            _ = TritonAttention.apply(Q, K, V, causal, softmax_scale)
+            _ = TritonAttention.apply(Q, K, V, softmax_scale)
         end.record()
 
     torch.cuda.synchronize()
 
     print(
         f"forward benchmark B={BATCH_SIZE}, H={NUM_HEADS}, S={SEQ_LEN}, D={HEAD_DIM}, "
-        f"causal={causal}, dtype={dtype}: {start.elapsed_time(end) / iters:.3f} ms"
+        f"dtype={dtype}: {start.elapsed_time(end) / iters:.3f} ms"
     )
 
 
@@ -832,14 +806,13 @@ if __name__ == "__main__":
     torch.set_float32_matmul_precision("highest")
 
     # Small tests first.
-    test_op(BATCH_SIZE=2, NUM_HEADS=3, SEQ_LEN=343, HEAD_DIM=16, causal=False, dtype=torch.float32)
-    #test_op(BATCH_SIZE=2, NUM_HEADS=3, SEQ_LEN=343, HEAD_DIM=16, causal=True, dtype=torch.float32)
+    test_op(BATCH_SIZE=2, NUM_HEADS=3, SEQ_LEN=343, HEAD_DIM=16, dtype=torch.float32)
+
 
 
     # Your actual dimensions.
-    test_op(BATCH_SIZE=1176, NUM_HEADS=3, SEQ_LEN=343, HEAD_DIM=16, causal=False, dtype=torch.float32)
-    #test_op(BATCH_SIZE=1176, NUM_HEADS=3, SEQ_LEN=343, HEAD_DIM=16, causal=True, dtype=torch.float32)
+    test_op(BATCH_SIZE=1176, NUM_HEADS=3, SEQ_LEN=343, HEAD_DIM=16, dtype=torch.float32)
     # Optional forward benchmark.
-    benchmark_forward(BATCH_SIZE=1176, NUM_HEADS=3, SEQ_LEN=343, HEAD_DIM=16, causal=False, dtype=torch.float32)
+    benchmark_forward(BATCH_SIZE=1176, NUM_HEADS=3, SEQ_LEN=343, HEAD_DIM=16, dtype=torch.float32)
 
     print("PASSED")
