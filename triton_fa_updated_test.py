@@ -45,7 +45,6 @@ def _attn_fwd(
     CAUSAL: tl.constexpr,
 
     NUM_WINDOWS: tl.constexpr,
-    HAS_RPB: tl.constexpr,
     HAS_MASK: tl.constexpr,
 ):
     block_q = tl.program_id(0)
@@ -99,16 +98,15 @@ def _attn_fwd(
 
         QK_block = tl.dot(Q_block, K_T_block, input_precision="ieee") * softmax_scale
 
-        if HAS_RPB:
-            rpb_block = tl.load(
-                RPB
-                + head * SEQ_LEN * SEQ_LEN
-                + offs_q[:, None] * SEQ_LEN
-                + offs_kv[None, :],
-                mask=valid_q[:, None] & valid_kv[None, :],
-                other=0.0,
-            )
-            QK_block += rpb_block
+        rpb_block = tl.load(
+            RPB
+            + head * SEQ_LEN * SEQ_LEN
+            + offs_q[:, None] * SEQ_LEN
+            + offs_kv[None, :],
+            mask=valid_q[:, None] & valid_kv[None, :],
+            other=0.0,
+        )
+        QK_block += rpb_block
 
         if HAS_MASK:
             window_index = batch % NUM_WINDOWS
@@ -221,7 +219,6 @@ def _attn_bwd_dq(
     CAUSAL: tl.constexpr,
 
     NUM_WINDOWS: tl.constexpr,
-    HAS_RPB: tl.constexpr,
     HAS_MASK: tl.constexpr,
 ):
     block_q = tl.program_id(0)
@@ -283,16 +280,15 @@ def _attn_bwd_dq(
 
         QK_block = tl.dot(Q_block, K_T_block, input_precision="ieee") * softmax_scale
 
-        if HAS_RPB:
-            rpb_block = tl.load(
-                RPB
-                + head * SEQ_LEN * SEQ_LEN
-                + offs_q[:, None] * SEQ_LEN
-                + offs_kv[None, :],
-                mask=valid_q[:, None] & valid_kv[None, :],
-                other=0.0,
-            )
-            QK_block += rpb_block
+        rpb_block = tl.load(
+            RPB
+            + head * SEQ_LEN * SEQ_LEN
+            + offs_q[:, None] * SEQ_LEN
+            + offs_kv[None, :],
+            mask=valid_q[:, None] & valid_kv[None, :],
+            other=0.0,
+        )
+        QK_block += rpb_block
 
         if HAS_MASK:
             window_index = batch % NUM_WINDOWS
@@ -337,6 +333,7 @@ def _attn_bwd_dk_dv(
     dO,
     dK,
     dV,
+    dRPB,
     M,
     D,
 
@@ -356,7 +353,6 @@ def _attn_bwd_dk_dv(
     CAUSAL: tl.constexpr,
 
     NUM_WINDOWS: tl.constexpr,
-    HAS_RPB: tl.constexpr,
     HAS_MASK: tl.constexpr,
 ):
     block_kv = tl.program_id(0)
@@ -419,25 +415,27 @@ def _attn_bwd_dk_dv(
 
         QK_T_block = tl.dot(K_block, Q_T_block, input_precision="ieee") * softmax_scale
 
-        if HAS_RPB:
-            rpb_T_block = tl.load(
-                RPB
-                + head * SEQ_LEN * SEQ_LEN
-                + offs_kv[:, None] * SEQ_LEN
-                + offs_q[None, :],
-                mask=valid_kv[:, None] & valid_q[None, :],
-                other=0.0,
-            )
-            QK_T_block += rpb_T_block
+
+        # [key, query] view of RPB[head, query, key]
+        rpb_T_block = tl.load(
+            RPB
+            + head * SEQ_LEN * SEQ_LEN
+            + offs_q[None, :] * SEQ_LEN
+            + offs_kv[:, None],
+            mask=valid_kv[:, None] & valid_q[None, :],
+            other=0.0,
+        )
+        QK_T_block += rpb_T_block
 
         if HAS_MASK:
             window_index = batch % NUM_WINDOWS
 
+            # [key, query] view of MASK[window, query, key]
             mask_T_block = tl.load(
                 MASK
                 + window_index * SEQ_LEN * SEQ_LEN
-                + offs_kv[:, None] * SEQ_LEN
-                + offs_q[None, :],
+                + offs_q[None, :] * SEQ_LEN
+                + offs_kv[:, None],
                 mask=valid_kv[:, None] & valid_q[None, :],
                 other=0.0,
             )
@@ -451,7 +449,6 @@ def _attn_bwd_dk_dv(
 
         QK_T_block = tl.where(keep, QK_T_block, -1.0e20)
         P_T_block = tl.exp(QK_T_block - M_block[None, :])
-
         P_T_block = tl.where(keep, P_T_block, 0.0)
 
         dV_block += tl.dot(P_T_block, dO_block, input_precision="ieee")
@@ -459,7 +456,22 @@ def _attn_bwd_dk_dv(
         dP_T_block = tl.dot(V_block, tl.trans(dO_block), input_precision="ieee")
         dS_T_block = P_T_block * (dP_T_block - D_block[None, :])
 
-        dK_block += softmax_scale * tl.dot(dS_T_block.to(tl.float32), tl.trans(Q_T_block), input_precision="ieee")
+        # this atomic add does not cost significant runtime as benchmarked
+        tl.atomic_add(
+            dRPB
+            + head * SEQ_LEN * SEQ_LEN
+            + offs_q[None, :] * SEQ_LEN
+            + offs_kv[:, None],
+            dS_T_block,
+            mask=keep,
+            sem="relaxed",
+        )
+
+        dK_block += softmax_scale * tl.dot(
+            dS_T_block.to(tl.float32),
+            tl.trans(Q_T_block),
+            input_precision="ieee",
+        )
 
     tl.store(
         dV + offset + offs_kv[:, None] * stride_seq + offs_d[None, :] * stride_dim,
@@ -481,7 +493,7 @@ class TritonAttention(torch.autograd.Function):
             Q: torch.Tensor,
             K: torch.Tensor,
             V: torch.Tensor,
-            RPB: torch.Tensor | None,
+            RPB: torch.Tensor,
             MASK: torch.Tensor | None,
             causal: bool,
             softmax_scale: float,
@@ -493,17 +505,13 @@ class TritonAttention(torch.autograd.Function):
         assert V.is_contiguous()
 
         BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM = Q.shape
-
-        HAS_RPB = RPB is not None
         HAS_MASK = MASK is not None
 
-        if HAS_RPB:
-            assert RPB.is_cuda
-            assert RPB.is_contiguous()
-            assert RPB.shape == (NUM_HEADS, SEQ_LEN, SEQ_LEN)
-            assert RPB.dtype == Q.dtype
-        else:
-            RPB = torch.empty((1,), device=Q.device, dtype=Q.dtype)
+
+        assert RPB.is_cuda
+        assert RPB.is_contiguous()
+        assert RPB.shape == (NUM_HEADS, SEQ_LEN, SEQ_LEN)
+        assert RPB.dtype == Q.dtype
 
         if HAS_MASK:
             assert MASK.is_cuda
@@ -563,7 +571,6 @@ class TritonAttention(torch.autograd.Function):
             CAUSAL=causal,
 
             NUM_WINDOWS=NUM_WINDOWS,
-            HAS_RPB=HAS_RPB,
             HAS_MASK=HAS_MASK,
 
             num_warps=4,
@@ -573,13 +580,12 @@ class TritonAttention(torch.autograd.Function):
         ctx.save_for_backward(Q, K, V, O, M, RPB, MASK)
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
-        ctx.has_rpb = HAS_RPB
         ctx.has_mask = HAS_MASK
         ctx.num_windows = NUM_WINDOWS
         return O
 
     @staticmethod
-    def backward(ctx: Any, dO: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, None, None, None, None]:
+    def backward(ctx: Any, dO: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, None, None, None]:
         Q, K, V, O, M, RPB, MASK = ctx.saved_tensors
 
         dO = dO.contiguous()
@@ -587,6 +593,7 @@ class TritonAttention(torch.autograd.Function):
         assert Q.is_contiguous()
         assert K.is_contiguous()
         assert V.is_contiguous()
+        assert RPB.is_contiguous()
         assert O.is_contiguous()
         assert dO.is_contiguous()
 
@@ -595,6 +602,9 @@ class TritonAttention(torch.autograd.Function):
         dQ = torch.empty_like(Q)
         dK = torch.empty_like(K)
         dV = torch.empty_like(V)
+
+        dRPB = torch.empty_like(RPB)
+        dRPB.zero_()
 
         D = torch.empty_like(M)
 
@@ -648,7 +658,6 @@ class TritonAttention(torch.autograd.Function):
             CAUSAL=ctx.causal,
 
             NUM_WINDOWS=ctx.num_windows,
-            HAS_RPB=ctx.has_rpb,
             HAS_MASK=ctx.has_mask,
 
             num_warps=4,
@@ -667,6 +676,7 @@ class TritonAttention(torch.autograd.Function):
             dO,
             dK,
             dV,
+            dRPB,
             M,
             D,
 
@@ -686,14 +696,13 @@ class TritonAttention(torch.autograd.Function):
             CAUSAL=ctx.causal,
 
             NUM_WINDOWS=ctx.num_windows,
-            HAS_RPB=ctx.has_rpb,
             HAS_MASK=ctx.has_mask,
 
             num_warps=4,
             num_stages=2,
         )
 
-        return dQ, dK, dV, None, None, None, None
+        return dQ, dK, dV, dRPB, None, None, None
 
 
 def torch_attention_ref(
