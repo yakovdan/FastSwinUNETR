@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from typing import Any
-
+from math_utills import *
 import torch
 import triton
 import triton.language as tl
@@ -793,9 +793,10 @@ def torch_attention_ref(
     Q: torch.Tensor,
     K: torch.Tensor,
     V: torch.Tensor,
+    RPB: torch.Tensor,
     softmax_scale: float,
 ) -> torch.Tensor:
-    P = torch.matmul(Q, K.transpose(-2, -1)) * softmax_scale
+    P = torch.matmul(Q, K.transpose(-2, -1)) * softmax_scale + RPB.to(Q.dtype)
 
     P = torch.softmax(P.float(), dim=-1).to(Q.dtype)
     return torch.matmul(P, V)
@@ -813,7 +814,7 @@ def test_op(
 ) -> None:
     torch.manual_seed(1234)
     torch.cuda.manual_seed_all(1234)
-
+    rpb = generate_rpb(n=SEQ_LEN, num_heads=NUM_HEADS)
     Q = torch.empty(
         (BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM),
         dtype=dtype,
@@ -898,12 +899,44 @@ def benchmark_forward(
         f"dtype={dtype}: {start.elapsed_time(end) / iters:.3f} ms"
     )
 
+def generate_rpb(n: int, window_size= 7, num_heads = 3) -> torch.Tensor:
+    relative_position_bias_table =  torch.zeros(
+            (2 * window_size - 1) * (2 * window_size - 1) * (2 * window_size - 1),
+            num_heads,
+        )
+    mesh_args = torch.meshgrid.__kwdefaults__
+    coords_d = torch.arange(window_size)
+    coords_h = torch.arange(window_size)
+    coords_w = torch.arange(window_size)
+    if mesh_args is not None:
+        coords = torch.stack(torch.meshgrid(coords_d, coords_h, coords_w, indexing="ij"))
+    else:
+        coords = torch.stack(torch.meshgrid(coords_d, coords_h, coords_w))
+    coords_flatten = torch.flatten(coords, 1)
+    relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]
+    relative_coords = relative_coords.permute(1, 2, 0).contiguous()
+    relative_coords[:, :, 0] += window_size - 1
+    relative_coords[:, :, 1] += window_size - 1
+    relative_coords[:, :, 2] += window_size - 1
+    relative_coords[:, :, 0] *= (2 * window_size - 1) * (2 * window_size - 1)
+    relative_coords[:, :, 1] *= 2 * window_size - 1
+
+
+    relative_position_index = relative_coords.sum(-1)
+    trunc_normal_(relative_position_bias_table, std=0.02)
+
+
+    relative_position_bias = relative_position_bias_table[
+        relative_position_index.clone()[:n, :n].reshape(-1)
+    ].reshape(n, n, -1).permute(2, 0, 1).contiguous()
+    return relative_position_bias.clone()
 
 if __name__ == "__main__":
-    x0 = torch.load('sw_input0.pt')
-    x1 = torch.load('sw_input1.pt')
-    m1 = torch.load('sw_input1_mask.pt')
-
+    # x0 = torch.load('sw_input0.pt')
+    # x1 = torch.load('sw_input1.pt')
+    # m1 = torch.load('sw_input1_mask.pt')
+    # x0 = torch.load('input_tensor.pt')
+    # m0 = torch.load('mask_tensor.pt')
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.set_float32_matmul_precision("highest")
 
