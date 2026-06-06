@@ -3,6 +3,44 @@ from typing import Any
 import torch
 
 
+def profile_module_forward(
+    module: Any,
+    x: torch.Tensor,
+    warmup_iters: int = 25,
+    profile_iters: int = 50,
+) -> dict[str, float]:
+    module.eval()
+
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+
+    # Warmup.
+    with torch.inference_mode():
+        for _ in range(warmup_iters):
+            _ = module(x)
+
+    torch.cuda.synchronize(x.device)
+
+    accumulated_ms: dict[str, float] = defaultdict(float)
+
+    # Profile.
+    with torch.inference_mode():
+        for _ in range(profile_iters):
+            start_event.record()
+            _ = module(x)
+            end_event.record()
+
+            torch.cuda.synchronize(x.device)
+            accumulated_ms["forward"] += start_event.elapsed_time(end_event)
+            for section_name, elapsed_ms in module.last_section_times_ms.items():
+                accumulated_ms[section_name] += elapsed_ms
+
+    return {
+        section_name: total_ms / profile_iters
+        for section_name, total_ms in accumulated_ms.items() if section_name != "forward"
+    }
+
+
 def profile_original_window_attention_forward(
     module: Any,
     x: torch.Tensor,
