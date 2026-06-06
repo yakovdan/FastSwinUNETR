@@ -32,6 +32,7 @@ class FastWindowAttention(nn.Module):
         qkv_bias: bool = False,
         attn_drop: float = 0.0,
         proj_drop: float = 0.0,
+        debug_mode = False,
     ) -> None:
         """
         Args:
@@ -44,6 +45,7 @@ class FastWindowAttention(nn.Module):
         """
 
         super().__init__()
+        self.debug_mode = debug_mode
         self.dim = dim
         self.window_size = window_size
         self.num_heads = num_heads
@@ -251,8 +253,9 @@ class FastWindowAttention(nn.Module):
                 section_name: start.elapsed_time(end)
                 for section_name, (start, end) in section_events.items()
             }
-
-        return x, q, k, v, relative_position_bias
+        if self.debug_mode:
+            return x, q, k, v, relative_position_bias
+        return x
 
 
 
