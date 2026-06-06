@@ -1,4 +1,4 @@
-
+import time
 from typing import Sequence, TypeVar, Union
 
 import numpy as np
@@ -6,15 +6,45 @@ from torch import nn
 from torch.nn import LayerNorm
 from torch.utils import checkpoint
 
+from profiling import profile_module_forward
 from swin_unter_utils import ensure_tuple_rep, LayerFactory, look_up_option, split_args, get_act_layer, get_window_size, window_partition, window_reverse, compute_mask
 from torch.nn import functional as F
 import torch
 from patch_merging import PatchMerging, PatchMergingV2
 from einops import rearrange
-from monai.networks.nets.swin_unetr import WindowAttention as WindowAttention
+from SwinAttention import FastWindowAttention as WindowAttention
 from unter import UnetrBasicBlock, UnetrUpBlock, UnetOutBlock
 
 Conv = LayerFactory(name="Convolution layers", description="Factory for creating convolution layers.")
+
+@Conv.factory_function("conv")
+def conv_factory(dim: int) -> type[nn.Conv1d | nn.Conv2d | nn.Conv3d]:
+    """
+    Convolutional layers in 1,2,3 dimensions.
+
+    Args:
+        dim: desired dimension of the convolutional layer
+
+    Returns:
+        Conv[dim]d
+    """
+    types = (nn.Conv1d, nn.Conv2d, nn.Conv3d)
+    return types[dim - 1]
+
+
+@Conv.factory_function("convtrans")
+def convtrans_factory(dim: int) -> type[nn.ConvTranspose1d | nn.ConvTranspose2d | nn.ConvTranspose3d]:
+    """
+    Transposed convolutional layers in 1,2,3 dimensions.
+
+    Args:
+        dim: desired dimension of the transposed convolutional layer
+
+    Returns:
+        ConvTranspose[dim]d
+    """
+    types = (nn.ConvTranspose1d, nn.ConvTranspose2d, nn.ConvTranspose3d)
+    return types[dim - 1]
 
 MERGING_MODE = {"merging": PatchMerging, "mergingv2": PatchMergingV2}
 
@@ -251,6 +281,7 @@ class SwinTransformerBlock(nn.Module):
         self.mlp = MLPBlock(hidden_size=dim, mlp_dim=mlp_hidden_dim, act=act_layer, dropout_rate=drop, dropout_mode="swin")
 
     def forward_part1(self, x, mask_matrix):
+
         x_shape = x.size()
         x = self.norm1(x)
         if len(x_shape) == 5:
@@ -284,6 +315,7 @@ class SwinTransformerBlock(nn.Module):
             shifted_x = x
             attn_mask = None
         x_windows = window_partition(shifted_x, window_size)
+
         attn_windows = self.attn(x_windows, mask=attn_mask)
         attn_windows = attn_windows.view(-1, *(window_size + (c,)))
         shifted_x = window_reverse(attn_windows, window_size, dims)
@@ -680,7 +712,9 @@ class SwinUNETR(nn.Module):
         """
 
         super().__init__()
-
+        self.last_section_times_ms = None
+        self.profile_sections = True 
+        
         if spatial_dims not in (2, 3):
             raise ValueError("spatial dimension should be 2 or 3.")
 
@@ -882,23 +916,109 @@ class SwinUNETR(nn.Module):
             )
 
     def forward(self, x_in):
+        
+        profile_sections = self.profile_sections
+        self.last_section_times_ms = {}
+
+        section_events: dict[str, tuple[torch.cuda.Event, torch.cuda.Event]] = {}
+
+        def record_section(section_name: str, fn):
+            if not profile_sections:
+                return fn()
+
+            if not x_in.is_cuda:
+                section_start = time.perf_counter()
+                result = fn()
+                self.last_section_times_ms[section_name] = (
+                                                                   time.perf_counter() - section_start
+                                                           ) * 1000.0
+                return result
+
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+
+            start.record()
+            result = fn()
+            end.record()
+
+            section_events[section_name] = (start, end)
+            return result
+        
         if not torch.jit.is_scripting() and not torch.jit.is_tracing():
             self._check_input_size(x_in.shape[2:])
-        hidden_states_out = self.swinViT(x_in, self.normalize)
-        enc0 = self.encoder1(x_in)
-        enc1 = self.encoder2(hidden_states_out[0])
-        enc2 = self.encoder3(hidden_states_out[1])
-        enc3 = self.encoder4(hidden_states_out[2])
-        dec4 = self.encoder10(hidden_states_out[4])
-        dec3 = self.decoder5(dec4, hidden_states_out[3])
-        dec2 = self.decoder4(dec3, enc3)
-        dec1 = self.decoder3(dec2, enc2)
-        dec0 = self.decoder2(dec1, enc1)
-        out = self.decoder1(dec0, enc0)
-        logits = self.out(out)
+        hidden_states_out = record_section(
+            "swinViT",
+            lambda: self.swinViT(x_in, self.normalize),
+        )
+
+        enc0 = record_section(
+            "encoder1",
+            lambda: self.encoder1(x_in),
+        )
+
+        enc1 = record_section(
+            "encoder2",
+            lambda: self.encoder2(hidden_states_out[0]),
+        )
+
+        enc2 = record_section(
+            "encoder3",
+            lambda: self.encoder3(hidden_states_out[1]),
+        )
+
+        enc3 = record_section(
+            "encoder4",
+            lambda: self.encoder4(hidden_states_out[2]),
+        )
+
+        dec4 = record_section(
+            "encoder10",
+            lambda: self.encoder10(hidden_states_out[4]),
+        )
+
+        dec3 = record_section(
+            "decoder5",
+            lambda: self.decoder5(dec4, hidden_states_out[3]),
+        )
+
+        dec2 = record_section(
+            "decoder4",
+            lambda: self.decoder4(dec3, enc3),
+        )
+
+        dec1 = record_section(
+            "decoder3",
+            lambda: self.decoder3(dec2, enc2),
+        )
+
+        dec0 = record_section(
+            "decoder2",
+            lambda: self.decoder2(dec1, enc1),
+        )
+
+        out = record_section(
+            "decoder1",
+            lambda: self.decoder1(dec0, enc0),
+        )
+
+        logits = record_section(
+            "out",
+            lambda: self.out(out),
+        )
+
+        if profile_sections and x_in.is_cuda:
+            torch.cuda.synchronize()
+            self.last_section_times_ms.update(
+                {
+                    section_name: start.elapsed_time(end)
+                    for section_name, (start, end) in section_events.items()
+                }
+            )
+
         return logits
 
 if __name__ == "__main__":
+    x = torch.load('model_input.pt', weights_only=False).to(torch.float32).to("cuda")
     model = SwinUNETR(
         in_channels=1,
         patch_size=2,
@@ -907,4 +1027,15 @@ if __name__ == "__main__":
         attn_drop_rate=0.25,
         feature_size=48,
         use_checkpoint=True,  # gradient checkpointing for reduced memory use at the cost of compute
-    )
+    ).to(torch.float32).to("cuda")
+
+    section_times = profile_module_forward(model, x)
+
+
+    total_ms = sum(section_times.values())
+
+    for section_name, elapsed_ms in section_times.items():
+        percentage = elapsed_ms / total_ms * 100.0
+        print(f"{section_name}: {elapsed_ms:.3f} ms ({percentage:.1f}%)")
+
+    print(f"Total: {total_ms:.3f} ms")

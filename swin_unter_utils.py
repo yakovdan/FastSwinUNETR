@@ -12,6 +12,8 @@ from keyword import iskeyword
 from textwrap import dedent, indent
 from typing import Any, Callable, TypeVar, Sequence
 from monai.networks.blocks.convolutions import Convolution
+from torch import nn
+
 T = TypeVar("T")
 
 def ensure_tuple(vals: Any, wrap_array: bool = False) -> tuple:
@@ -473,6 +475,22 @@ class LayerFactory(ComponentStore):
         return super().__getattribute__(key)
 
 Act = LayerFactory(name="Activation layers", description="Factory for creating activation layers.")
+
+
+
+Act.add_factory_class("elu", nn.modules.ELU)
+Act.add_factory_class("relu", nn.modules.ReLU)
+Act.add_factory_class("leakyrelu", nn.modules.LeakyReLU)
+Act.add_factory_class("prelu", nn.modules.PReLU)
+Act.add_factory_class("relu6", nn.modules.ReLU6)
+Act.add_factory_class("selu", nn.modules.SELU)
+Act.add_factory_class("celu", nn.modules.CELU)
+Act.add_factory_class("gelu", nn.modules.GELU)
+Act.add_factory_class("sigmoid", nn.modules.Sigmoid)
+Act.add_factory_class("tanh", nn.modules.Tanh)
+Act.add_factory_class("softmax", nn.modules.Softmax)
+Act.add_factory_class("logsoftmax", nn.modules.LogSoftmax)
+
 def get_act_layer(name: tuple | str):
     """
     Create an activation layer instance.
@@ -601,6 +619,40 @@ def compute_mask(dims, window_size, shift_size, device):
     return attn_mask
 
 Norm = LayerFactory(name="Normalization layers", description="Factory for creating normalization layers.")
+Norm.add_factory_class("group", nn.GroupNorm)
+Norm.add_factory_class("layer", nn.LayerNorm)
+Norm.add_factory_class("localresponse", nn.LocalResponseNorm)
+Norm.add_factory_class("syncbatch", nn.SyncBatchNorm)
+
+
+@Norm.factory_function("instance")
+def instance_factory(dim: int) -> type[nn.InstanceNorm1d | nn.InstanceNorm2d | nn.InstanceNorm3d]:
+    """
+    Instance normalization layers in 1,2,3 dimensions.
+
+    Args:
+        dim: desired dimension of the instance normalization layer
+
+    Returns:
+        InstanceNorm[dim]d
+    """
+    types = (nn.InstanceNorm1d, nn.InstanceNorm2d, nn.InstanceNorm3d)
+    return types[dim - 1]
+
+
+@Norm.factory_function("batch")
+def batch_factory(dim: int) -> type[nn.BatchNorm1d | nn.BatchNorm2d | nn.BatchNorm3d]:
+    """
+    Batch normalization layers in 1,2,3 dimensions.
+
+    Args:
+        dim: desired dimension of the batch normalization layer
+
+    Returns:
+        BatchNorm[dim]d
+    """
+    types = (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)
+    return types[dim - 1]
 
 def get_padding(kernel_size: Sequence[int] | int, stride: Sequence[int] | int) -> tuple[int, ...] | int:
     kernel_size_np = np.atleast_1d(kernel_size)
