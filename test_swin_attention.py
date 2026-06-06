@@ -1,7 +1,4 @@
 from __future__ import annotations
-import torch
-from torch import nn
-from collections import defaultdict
 from SwinAttention import FastWindowAttention
 from monai.networks.nets.swin_unetr import WindowAttention as OrigWindowAttention
 import numpy as np

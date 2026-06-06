@@ -1,4 +1,6 @@
 from __future__ import annotations
+
+import triton_shifted_window_fa
 from math_utills import *
 import torch
 from triton_shifted_window_fa import TritonAttention
@@ -8,9 +10,17 @@ def torch_attention_ref(
     K: torch.Tensor,
     V: torch.Tensor,
     RPB: torch.Tensor,
+    MASK: torch.Tensor,
     softmax_scale: float,
+    num_heads: int,
+    n: int
 ) -> torch.Tensor:
+    b = Q.shape[0]
     P = torch.matmul(Q, K.transpose(-2, -1)) * softmax_scale + RPB.to(Q.dtype)
+    nw = MASK.shape[0]
+    P = P.view(b // nw, nw, num_heads, n, n) + MASK.unsqueeze(1).unsqueeze(0)
+    P = P.view(-1, num_heads, n, n)
+
 
     P = torch.softmax(P.float(), dim=-1).to(Q.dtype)
     return torch.matmul(P, V)
@@ -29,6 +39,7 @@ def test_op(
     torch.manual_seed(1234)
     torch.cuda.manual_seed_all(1234)
     rpb = generate_rpb(n=SEQ_LEN, num_heads=NUM_HEADS)
+    mask = generate_mask(BATCH_SIZE, SEQ_LEN, num_windows=8)
     Q = torch.empty(
         (BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM),
         dtype=dtype,
@@ -41,7 +52,7 @@ def test_op(
     dO = torch.randn_like(Q)
     softmax_scale = HEAD_DIM ** -0.5
 
-    ref_O = torch_attention_ref(Q, K, V, softmax_scale)
+    ref_O = torch_attention_ref(Q, K, V, rpb, mask, softmax_scale, num_heads=NUM_HEADS, n=SEQ_LEN)
     ref_O.backward(dO)
 
     ref_dQ = Q.grad.detach().clone()
@@ -52,7 +63,7 @@ def test_op(
     K.grad = None
     V.grad = None
 
-    tri_O = TritonAttention.apply(Q, K, V, softmax_scale)
+    tri_O = TritonAttention.apply(Q, K, V, rpb, mask, softmax_scale)
     tri_O.backward(dO)
 
     tri_dQ = Q.grad.detach().clone()
@@ -84,16 +95,18 @@ def benchmark_forward(
     HEAD_DIM: int,
     dtype: torch.dtype = torch.float16,
     warmup: int = 25,
-    iters: int = 100,
+    iters: int = 50,
 ) -> None:
     Q = torch.randn((BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM), device="cuda", dtype=dtype)
     K = torch.randn_like(Q)
     V = torch.randn_like(Q)
     softmax_scale = HEAD_DIM ** -0.5
+    rpb = generate_rpb(n=SEQ_LEN, num_heads=NUM_HEADS)
+    mask = generate_mask(BATCH_SIZE, SEQ_LEN, num_windows=8)
 
     with torch.inference_mode():
         for _ in range(warmup):
-            _ = TritonAttention.apply(Q, K, V, softmax_scale)
+            _ = TritonAttention.apply(Q, K, V, rpb, mask, softmax_scale)
 
     torch.cuda.synchronize()
 
@@ -103,11 +116,14 @@ def benchmark_forward(
     with torch.inference_mode():
         start.record()
         for _ in range(iters):
-            _ = TritonAttention.apply(Q, K, V, softmax_scale)
+            _ = TritonAttention.apply(Q, K, V, rpb, mask, softmax_scale)
         end.record()
 
     torch.cuda.synchronize()
-
+    print(triton_shifted_window_fa._attn_fwd.best_config)
+    print(triton_shifted_window_fa._attn_bwd_dq.best_config)
+    print(triton_shifted_window_fa._attn_bwd_dk_dv.best_config)
+    print(triton_shifted_window_fa._attn_bwd_preprocess.best_config)
     print(
         f"forward benchmark B={BATCH_SIZE}, H={NUM_HEADS}, S={SEQ_LEN}, D={HEAD_DIM}, "
         f"dtype={dtype}: {start.elapsed_time(end) / iters:.3f} ms"
@@ -143,7 +159,12 @@ def generate_rpb(n: int, window_size= 7, num_heads = 3) -> torch.Tensor:
     relative_position_bias = relative_position_bias_table[
         relative_position_index.clone()[:n, :n].reshape(-1)
     ].reshape(n, n, -1).permute(2, 0, 1).contiguous()
-    return relative_position_bias.clone()
+    return relative_position_bias.clone().to('cuda')
+
+def generate_mask(b: int, n: int, num_windows: int = 8, dtype=torch.float32) -> torch.Tensor:
+    shape = (b // num_windows, n, n)
+    mask = -100 * torch.randint(low = 0, high= 2, size=shape, dtype= dtype, device= torch.device("cuda"))
+    return mask
 
 if __name__ == "__main__":
     # x0 = torch.load('sw_input0.pt')
@@ -155,7 +176,7 @@ if __name__ == "__main__":
     torch.set_float32_matmul_precision("highest")
 
     # Small tests first.
-    test_op(BATCH_SIZE=2, NUM_HEADS=3, SEQ_LEN=343, HEAD_DIM=16, dtype=torch.float32)
+    test_op(BATCH_SIZE=1176, NUM_HEADS=3, SEQ_LEN=343, HEAD_DIM=16, dtype=torch.float32)
 
 
 

@@ -7,7 +7,137 @@ import triton
 import triton.language as tl
 
 # GOLD VERSION
+# import os
+# os.environ["TRITON_PRINT_AUTOTUNING"] = "1"
 
+BEST_FWD_CONFIGS = [
+    triton.Config(
+        {
+            "BLOCK_SIZE_Q": 32,
+            "BLOCK_SIZE_KV": 16,
+        },
+        num_warps=1,
+        num_stages=2,
+    )
+]
+
+BEST_BWD_PREPROCESS_CONFIGS = [
+    triton.Config(
+        {
+            "BLOCK_SIZE_Q": 256,
+        },
+        num_warps=2,
+        num_stages=3,
+    )
+]
+
+BEST_BWD_DQ_CONFIGS = [
+    triton.Config(
+        {
+            "BLOCK_Q": 32,
+            "BLOCK_KV": 16,
+        },
+        num_warps=1,
+        num_stages=2,
+    )
+]
+
+BEST_BWD_DK_DV_CONFIGS = [
+    triton.Config(
+        {
+            "BLOCK_Q": 32,
+            "BLOCK_KV": 32,
+        },
+        num_warps=1,
+        num_stages=1,
+    )
+]
+
+def make_fwd_configs():
+    configs = []
+    for block_q in [4, 8, 16, 32, 64]:
+        for block_kv in [16, 32]:
+            for num_warps in [1, 2, 4, 8]:
+                for num_stages in [1, 2, 3]:
+                    if block_q == 256 and block_kv == 128:
+                        continue
+
+                    configs.append(
+                        triton.Config(
+                            {
+                                "BLOCK_SIZE_Q": block_q,
+                                "BLOCK_SIZE_KV": block_kv,
+                            },
+                            num_warps=num_warps,
+                            num_stages=num_stages,
+                        )
+                    )
+    return configs
+
+def make_preproc_configs():
+    configs = []
+    for block_q in [16, 32, 64, 128, 256]:
+            for num_warps in [1, 2, 4, 8]:
+                for num_stages in [1, 2, 3]:
+
+                    configs.append(
+                        triton.Config(
+                            {
+                                "BLOCK_SIZE_Q": block_q,
+                            },
+                            num_warps=num_warps,
+                            num_stages=num_stages,
+                        )
+                    )
+    return configs
+
+def make_bwd_dq_configs():
+    configs = []
+    for block_q in [4, 8, 16, 32, 64]:
+        for block_kv in [16, 32]:
+            for num_warps in [1, 2, 4, 8]:
+                for num_stages in [1, 2, 3]:
+                    if block_q == 256 and block_kv == 128:
+                        continue
+
+                    configs.append(
+                        triton.Config(
+                            {
+                                "BLOCK_Q": block_q,
+                                "BLOCK_KV": block_kv,
+                            },
+                            num_warps=num_warps,
+                            num_stages=num_stages,
+                        )
+                    )
+    return configs
+
+
+def make_bwd_dv_dk_configs():
+    configs = []
+    for block_q in [16, 32]:
+        for block_kv in [4, 8, 16, 32, 64]:
+            for num_warps in [1, 2, 4, 8]:
+                for num_stages in [1, 2, 3]:
+                    if block_q == 256 and block_kv == 128:
+                        continue
+
+                    configs.append(
+                        triton.Config(
+                            {
+                                "BLOCK_Q": block_q,
+                                "BLOCK_KV": block_kv,
+                            },
+                            num_warps=num_warps,
+                            num_stages=num_stages,
+                        )
+                    )
+    return configs
+
+@triton.autotune(
+    configs=BEST_FWD_CONFIGS,
+    key=["SEQ_LEN", "HEAD_DIM", "HAS_MASK"],
+)
 @triton.jit
 def _attn_fwd(
     Q,
@@ -151,23 +281,7 @@ def _attn_fwd(
 
 
 @triton.autotune(
-    configs=[
-        triton.Config(
-            {"BLOCK_SIZE_Q": 32},
-            num_warps=1,
-            num_stages=2,
-        ),
-        triton.Config(
-            {"BLOCK_SIZE_Q": 64},
-            num_warps=2,
-            num_stages=2,
-        ),
-        triton.Config(
-            {"BLOCK_SIZE_Q": 128},
-            num_warps=4,
-            num_stages=2,
-        ),
-    ],
+    configs=BEST_BWD_PREPROCESS_CONFIGS,
     key=["SEQ_LEN", "HEAD_DIM"],
 )
 
@@ -210,43 +324,7 @@ def _attn_bwd_preprocess(
 
 
 @triton.autotune(
-    configs=[
-        triton.Config(
-            {"BLOCK_Q": 32, "BLOCK_KV": 32},
-            num_warps=2,
-            num_stages=2,
-        ),
-        triton.Config(
-            {"BLOCK_Q": 32, "BLOCK_KV": 64},
-            num_warps=4,
-            num_stages=2,
-        ),
-        triton.Config(
-            {"BLOCK_Q": 64, "BLOCK_KV": 32},
-            num_warps=4,
-            num_stages=2,
-        ),
-        triton.Config(
-            {"BLOCK_Q": 64, "BLOCK_KV": 64},
-            num_warps=4,
-            num_stages=2,
-        ),
-        triton.Config(
-            {"BLOCK_Q": 64, "BLOCK_KV": 128},
-            num_warps=4,
-            num_stages=2,
-        ),
-        triton.Config(
-            {"BLOCK_Q": 128, "BLOCK_KV": 32},
-            num_warps=4,
-            num_stages=2,
-        ),
-        triton.Config(
-            {"BLOCK_Q": 128, "BLOCK_KV": 64},
-            num_warps=4,
-            num_stages=2,
-        ),
-    ],
+    configs=BEST_BWD_DQ_CONFIGS,
     key=["SEQ_LEN", "HEAD_DIM", "HAS_MASK"],
 )
 
@@ -379,38 +457,7 @@ def _attn_bwd_dq(
 
 
 @triton.autotune(
-    configs=[
-        triton.Config(
-            {"BLOCK_Q": 32, "BLOCK_KV": 32},
-            num_warps=2,
-            num_stages=2,
-        ),
-        triton.Config(
-            {"BLOCK_Q": 64, "BLOCK_KV": 32},
-            num_warps=4,
-            num_stages=2,
-        ),
-        triton.Config(
-            {"BLOCK_Q": 32, "BLOCK_KV": 64},
-            num_warps=4,
-            num_stages=2,
-        ),
-        triton.Config(
-            {"BLOCK_Q": 64, "BLOCK_KV": 64},
-            num_warps=4,
-            num_stages=2,
-        ),
-        triton.Config(
-            {"BLOCK_Q": 128, "BLOCK_KV": 32},
-            num_warps=4,
-            num_stages=2,
-        ),
-        triton.Config(
-            {"BLOCK_Q": 128, "BLOCK_KV": 64},
-            num_warps=4,
-            num_stages=2,
-        ),
-    ],
+    configs=BEST_BWD_DK_DV_CONFIGS,
     key=["SEQ_LEN", "HEAD_DIM", "HAS_MASK"],
 )
 
@@ -611,11 +658,15 @@ class TritonAttention(torch.autograd.Function):
         O = torch.empty_like(Q)
         M = torch.empty((BATCH_SIZE, NUM_HEADS, SEQ_LEN), device=Q.device, dtype=torch.float32)
 
-        BLOCK_SIZE_Q = 64
-        BLOCK_SIZE_KV = 64
+#        BLOCK_SIZE_Q = 64
+#        BLOCK_SIZE_KV = 64
+#         grid = (
+#             triton.cdiv(SEQ_LEN, BLOCK_SIZE_Q),
+#             BATCH_SIZE * NUM_HEADS,
+#         )
 
-        grid = (
-            triton.cdiv(SEQ_LEN, BLOCK_SIZE_Q),
+        grid = lambda args: (
+            triton.cdiv(SEQ_LEN, args["BLOCK_SIZE_Q"]),
             BATCH_SIZE * NUM_HEADS,
         )
 
@@ -650,14 +701,14 @@ class TritonAttention(torch.autograd.Function):
             NUM_HEADS=NUM_HEADS,
             SEQ_LEN=SEQ_LEN,
             HEAD_DIM=HEAD_DIM,
-            BLOCK_SIZE_Q=BLOCK_SIZE_Q,
-            BLOCK_SIZE_KV=BLOCK_SIZE_KV,
+            #BLOCK_SIZE_Q=BLOCK_SIZE_Q,
+            #BLOCK_SIZE_KV=BLOCK_SIZE_KV,
 
             NUM_WINDOWS=NUM_WINDOWS,
             HAS_MASK=HAS_MASK,
 
-            num_warps=4,
-            num_stages=2,
+            #num_warps=4,
+            #num_stages=2,
         )
 
         ctx.save_for_backward(Q, K, V, O, M, RPB, MASK)
@@ -685,7 +736,7 @@ class TritonAttention(torch.autograd.Function):
         dK = torch.empty_like(K)
         dV = torch.empty_like(V)
 
-        dRPB = torch.empty_like(RPB)
+        dRPB = torch.empty_like(RPB, dtype=torch.float32)
         dRPB.zero_()
 
         D = torch.empty_like(M)
