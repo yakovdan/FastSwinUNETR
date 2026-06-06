@@ -5,7 +5,7 @@ import torch
 from torch import nn
 from math_utills import *
 
-from triton_fa_updated_test import TritonAttention
+from triton_shifted_window_fa import TritonAttention
 
 
 
@@ -185,7 +185,20 @@ class FastWindowAttention(nn.Module):
         if mask is not None:
             mask = mask.contiguous().to(dtype=q.dtype)
 
-        attn = TritonAttention.apply(q.contiguous(), k.contiguous(), v.contiguous(), relative_position_bias, mask, self.scale).transpose(1, 2).reshape(b, n, c)
+        # Section 4-8, fused Triton attention
+        attn = record_section(
+            "Section 4-8, Triton fused attention",
+            lambda: TritonAttention.apply(
+                q.contiguous(),
+                k.contiguous(),
+                v.contiguous(),
+                relative_position_bias,
+                mask,
+                self.scale,
+            ).transpose(1, 2).reshape(b, n, c),
+        )
+
+
         # # Section 4, apply RPB to attention
         # attn = record_section(
         #     "Section 4, apply RPB to attention",
