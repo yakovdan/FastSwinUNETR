@@ -1,0 +1,789 @@
+from __future__ import annotations
+
+from typing import Any
+from math_utills import *
+import torch
+import triton
+import triton.language as tl
+
+# GOLD VERSION
+
+@triton.jit
+def _attn_fwd(
+    Q,
+    K,
+    V,
+    softmax_scale,
+    M,
+    O,
+
+    RPB,     # [H, S, S], dummy [1] if disabled
+    MASK,    # [NW, S, S], dummy [1] if disabled
+
+    stride_Q_batch,
+    stride_Q_head,
+    stride_Q_seq,
+    stride_Q_dim,
+    stride_K_batch,
+    stride_K_head,
+    stride_K_seq,
+    stride_K_dim,
+    stride_V_batch,
+    stride_V_head,
+    stride_V_seq,
+    stride_V_dim,
+    stride_O_batch,
+    stride_O_head,
+    stride_O_seq,
+    stride_O_dim,
+
+    NUM_HEADS: tl.constexpr,
+    SEQ_LEN: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_SIZE_Q: tl.constexpr,
+    BLOCK_SIZE_KV: tl.constexpr,
+
+    NUM_WINDOWS: tl.constexpr,
+    HAS_MASK: tl.constexpr,
+):
+    block_q = tl.program_id(0)
+    batch_head = tl.program_id(1)
+
+    batch = batch_head // NUM_HEADS
+    head = batch_head % NUM_HEADS
+
+    q_offset = batch * stride_Q_batch + head * stride_Q_head
+    k_offset = batch * stride_K_batch + head * stride_K_head
+    v_offset = batch * stride_V_batch + head * stride_V_head
+    o_offset = batch * stride_O_batch + head * stride_O_head
+
+    offs_q = block_q * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q)
+    offs_kv_base = tl.arange(0, BLOCK_SIZE_KV)
+    offs_d = tl.arange(0, HEAD_DIM)
+
+    valid_q = offs_q < SEQ_LEN
+
+    Q_block = tl.load(
+        Q + q_offset + offs_q[:, None] * stride_Q_seq + offs_d[None, :] * stride_Q_dim,
+        mask=valid_q[:, None],
+        other=0.0,
+    )
+
+    m_i = tl.full((BLOCK_SIZE_Q,), -1.0e20, dtype=tl.float32)
+    l_i = tl.zeros((BLOCK_SIZE_Q,), dtype=tl.float32)
+    O_block = tl.zeros((BLOCK_SIZE_Q, HEAD_DIM), dtype=tl.float32)
+
+    for start_kv in range(0, SEQ_LEN, BLOCK_SIZE_KV):
+        offs_kv = start_kv + offs_kv_base
+        valid_kv = offs_kv < SEQ_LEN
+
+        K_T_block = tl.load(
+            K
+            + k_offset
+            + offs_d[:, None] * stride_K_dim
+            + offs_kv[None, :] * stride_K_seq,
+            mask=valid_kv[None, :],
+            other=0.0,
+        )
+
+        V_block = tl.load(
+            V
+            + v_offset
+            + offs_kv[:, None] * stride_V_seq
+            + offs_d[None, :] * stride_V_dim,
+            mask=valid_kv[:, None],
+            other=0.0,
+        )
+
+        QK_block = tl.dot(Q_block, K_T_block, input_precision="ieee") * softmax_scale
+
+        rpb_block = tl.load(
+            RPB
+            + head * SEQ_LEN * SEQ_LEN
+            + offs_q[:, None] * SEQ_LEN
+            + offs_kv[None, :],
+            mask=valid_q[:, None] & valid_kv[None, :],
+            other=0.0,
+        )
+        QK_block += rpb_block
+
+        if HAS_MASK:
+            window_index = batch % NUM_WINDOWS
+
+            mask_block = tl.load(
+                MASK
+                + window_index * SEQ_LEN * SEQ_LEN
+                + offs_q[:, None] * SEQ_LEN
+                + offs_kv[None, :],
+                mask=valid_q[:, None] & valid_kv[None, :],
+                other=0.0,
+            )
+            QK_block += mask_block
+
+        keep = valid_q[:, None] & valid_kv[None, :]
+
+        QK_block = tl.where(keep, QK_block, -1.0e20)
+
+        m_ij = tl.maximum(m_i, tl.max(QK_block, axis=1))
+        P_block = tl.exp(QK_block - m_ij[:, None])
+
+        alpha = tl.exp(m_i - m_ij)
+        l_ij = tl.sum(P_block, axis=1)
+
+        O_block = O_block * alpha[:, None] + tl.dot(P_block, V_block, input_precision="ieee")
+        l_i = l_i * alpha + l_ij
+        m_i = m_ij
+
+    O_block = O_block / l_i[:, None]
+    M_block = m_i + tl.log(l_i)
+
+    tl.store(
+        M + batch_head * SEQ_LEN + offs_q,
+        M_block,
+        mask=valid_q,
+    )
+
+    tl.store(
+        O + o_offset + offs_q[:, None] * stride_O_seq + offs_d[None, :] * stride_O_dim,
+        O_block,
+        mask=valid_q[:, None],
+    )
+
+
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {"BLOCK_SIZE_Q": 32},
+            num_warps=1,
+            num_stages=2,
+        ),
+        triton.Config(
+            {"BLOCK_SIZE_Q": 64},
+            num_warps=2,
+            num_stages=2,
+        ),
+        triton.Config(
+            {"BLOCK_SIZE_Q": 128},
+            num_warps=4,
+            num_stages=2,
+        ),
+    ],
+    key=["SEQ_LEN", "HEAD_DIM"],
+)
+
+@triton.jit
+def _attn_bwd_preprocess(
+    O,
+    dO,
+    D,
+    SEQ_LEN: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_SIZE_Q: tl.constexpr,
+):
+    block_q = tl.program_id(0)
+    batch_head = tl.program_id(1)
+
+    offs_q = block_q * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q)
+    offs_d = tl.arange(0, HEAD_DIM)
+
+    valid_q = offs_q < SEQ_LEN
+
+    O_block = tl.load(
+        O + batch_head * SEQ_LEN * HEAD_DIM + offs_q[:, None] * HEAD_DIM + offs_d[None, :],
+        mask=valid_q[:, None],
+        other=0.0,
+    )
+
+    dO_block = tl.load(
+        dO + batch_head * SEQ_LEN * HEAD_DIM + offs_q[:, None] * HEAD_DIM + offs_d[None, :],
+        mask=valid_q[:, None],
+        other=0.0,
+    ).to(tl.float32)
+
+    D_block = tl.sum(O_block * dO_block, axis=1)
+
+    tl.store(
+        D + batch_head * SEQ_LEN + offs_q,
+        D_block,
+        mask=valid_q,
+    )
+
+
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {"BLOCK_Q": 32, "BLOCK_KV": 32},
+            num_warps=2,
+            num_stages=2,
+        ),
+        triton.Config(
+            {"BLOCK_Q": 32, "BLOCK_KV": 64},
+            num_warps=4,
+            num_stages=2,
+        ),
+        triton.Config(
+            {"BLOCK_Q": 64, "BLOCK_KV": 32},
+            num_warps=4,
+            num_stages=2,
+        ),
+        triton.Config(
+            {"BLOCK_Q": 64, "BLOCK_KV": 64},
+            num_warps=4,
+            num_stages=2,
+        ),
+        triton.Config(
+            {"BLOCK_Q": 64, "BLOCK_KV": 128},
+            num_warps=4,
+            num_stages=2,
+        ),
+        triton.Config(
+            {"BLOCK_Q": 128, "BLOCK_KV": 32},
+            num_warps=4,
+            num_stages=2,
+        ),
+        triton.Config(
+            {"BLOCK_Q": 128, "BLOCK_KV": 64},
+            num_warps=4,
+            num_stages=2,
+        ),
+    ],
+    key=["SEQ_LEN", "HEAD_DIM", "HAS_MASK"],
+)
+
+@triton.jit
+def _attn_bwd_dq(
+    Q,
+    K,
+    V,
+    softmax_scale,
+    dO,
+    dQ,
+    M,
+    D,
+
+    RPB,
+    MASK,
+
+    stride_batch,
+    stride_head,
+    stride_seq,
+    stride_dim,
+
+    NUM_HEADS: tl.constexpr,
+    SEQ_LEN: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_Q: tl.constexpr,
+    BLOCK_KV: tl.constexpr,
+
+    NUM_WINDOWS: tl.constexpr,
+    HAS_MASK: tl.constexpr,
+):
+    block_q = tl.program_id(0)
+    batch_head = tl.program_id(1)
+
+    batch = batch_head // NUM_HEADS
+    head = batch_head % NUM_HEADS
+
+    offset = batch * stride_batch + head * stride_head
+    offset_lse = batch_head * SEQ_LEN
+
+    offs_q = block_q * BLOCK_Q + tl.arange(0, BLOCK_Q)
+    offs_kv_base = tl.arange(0, BLOCK_KV)
+    offs_d = tl.arange(0, HEAD_DIM)
+
+    valid_q = offs_q < SEQ_LEN
+
+    Q_block = tl.load(
+        Q + offset + offs_q[:, None] * stride_seq + offs_d[None, :] * stride_dim,
+        mask=valid_q[:, None],
+        other=0.0,
+    )
+
+    dO_block = tl.load(
+        dO + offset + offs_q[:, None] * stride_seq + offs_d[None, :] * stride_dim,
+        mask=valid_q[:, None],
+        other=0.0,
+    )
+
+    M_block = tl.load(
+        M + offset_lse + offs_q,
+        mask=valid_q,
+        other=0.0,
+    )[:, None]
+
+    D_block = tl.load(
+        D + offset_lse + offs_q,
+        mask=valid_q,
+        other=0.0,
+    )
+
+    dQ_block = tl.zeros((BLOCK_Q, HEAD_DIM), dtype=tl.float32)
+
+    for start_kv in range(0, SEQ_LEN, BLOCK_KV):
+        offs_kv = start_kv + offs_kv_base
+        valid_kv = offs_kv < SEQ_LEN
+
+        K_T_block = tl.load(
+            K + offset + offs_d[:, None] * stride_dim + offs_kv[None, :] * stride_seq,
+            mask=valid_kv[None, :],
+            other=0.0,
+        )
+
+        V_T_block = tl.load(
+            V + offset + offs_d[:, None] * stride_dim + offs_kv[None, :] * stride_seq,
+            mask=valid_kv[None, :],
+            other=0.0,
+        )
+
+        QK_block = tl.dot(Q_block, K_T_block, input_precision="ieee") * softmax_scale
+
+        rpb_block = tl.load(
+            RPB
+            + head * SEQ_LEN * SEQ_LEN
+            + offs_q[:, None] * SEQ_LEN
+            + offs_kv[None, :],
+            mask=valid_q[:, None] & valid_kv[None, :],
+            other=0.0,
+        )
+        QK_block += rpb_block
+
+        if HAS_MASK:
+            window_index = batch % NUM_WINDOWS
+
+            mask_block = tl.load(
+                MASK
+                + window_index * SEQ_LEN * SEQ_LEN
+                + offs_q[:, None] * SEQ_LEN
+                + offs_kv[None, :],
+                mask=valid_q[:, None] & valid_kv[None, :],
+                other=0.0,
+            )
+            QK_block += mask_block
+
+        keep = valid_q[:, None] & valid_kv[None, :]
+
+        QK_block = tl.where(keep, QK_block, -1.0e20)
+        P_block = tl.exp(QK_block - M_block)
+        P_block = tl.where(keep, P_block, 0.0)
+
+        dP_block = tl.dot(dO_block, V_T_block, input_precision="ieee")
+        dS_block = P_block * (dP_block - D_block[:, None])
+
+        dQ_block += softmax_scale * tl.dot(dS_block, tl.trans(K_T_block),input_precision="ieee")
+
+    tl.store(
+        dQ + offset + offs_q[:, None] * stride_seq + offs_d[None, :] * stride_dim,
+        dQ_block,
+        mask=valid_q[:, None],
+    )
+
+
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {"BLOCK_Q": 32, "BLOCK_KV": 32},
+            num_warps=2,
+            num_stages=2,
+        ),
+        triton.Config(
+            {"BLOCK_Q": 64, "BLOCK_KV": 32},
+            num_warps=4,
+            num_stages=2,
+        ),
+        triton.Config(
+            {"BLOCK_Q": 32, "BLOCK_KV": 64},
+            num_warps=4,
+            num_stages=2,
+        ),
+        triton.Config(
+            {"BLOCK_Q": 64, "BLOCK_KV": 64},
+            num_warps=4,
+            num_stages=2,
+        ),
+        triton.Config(
+            {"BLOCK_Q": 128, "BLOCK_KV": 32},
+            num_warps=4,
+            num_stages=2,
+        ),
+        triton.Config(
+            {"BLOCK_Q": 128, "BLOCK_KV": 64},
+            num_warps=4,
+            num_stages=2,
+        ),
+    ],
+    key=["SEQ_LEN", "HEAD_DIM", "HAS_MASK"],
+)
+
+@triton.jit
+def _attn_bwd_dk_dv(
+    Q,
+    K,
+    V,
+    softmax_scale,
+    dO,
+    dK,
+    dV,
+    dRPB,
+    M,
+    D,
+
+    RPB,
+    MASK,
+
+    stride_batch,
+    stride_head,
+    stride_seq,
+    stride_dim,
+
+    NUM_HEADS: tl.constexpr,
+    SEQ_LEN: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_Q: tl.constexpr,
+    BLOCK_KV: tl.constexpr,
+
+    NUM_WINDOWS: tl.constexpr,
+    HAS_MASK: tl.constexpr,
+):
+    block_kv = tl.program_id(0)
+    batch_head = tl.program_id(1)
+
+    batch = batch_head // NUM_HEADS
+    head = batch_head % NUM_HEADS
+
+    offset = batch * stride_batch + head * stride_head
+    offset_lse = batch_head * SEQ_LEN
+
+    offs_kv = block_kv * BLOCK_KV + tl.arange(0, BLOCK_KV)
+    offs_q_base = tl.arange(0, BLOCK_Q)
+    offs_d = tl.arange(0, HEAD_DIM)
+
+    valid_kv = offs_kv < SEQ_LEN
+
+    K_block = tl.load(
+        K + offset + offs_kv[:, None] * stride_seq + offs_d[None, :] * stride_dim,
+        mask=valid_kv[:, None],
+        other=0.0,
+    )
+
+    V_block = tl.load(
+        V + offset + offs_kv[:, None] * stride_seq + offs_d[None, :] * stride_dim,
+        mask=valid_kv[:, None],
+        other=0.0,
+    )
+
+    dK_block = tl.zeros((BLOCK_KV, HEAD_DIM), dtype=tl.float32)
+    dV_block = tl.zeros((BLOCK_KV, HEAD_DIM), dtype=tl.float32)
+
+    for start_q in range(0, SEQ_LEN, BLOCK_Q):
+        offs_q = start_q + offs_q_base
+        valid_q = offs_q < SEQ_LEN
+
+        Q_T_block = tl.load(
+            Q + offset + offs_d[:, None] * stride_dim + offs_q[None, :] * stride_seq,
+            mask=valid_q[None, :],
+            other=0.0,
+        )
+
+        dO_block = tl.load(
+            dO + offset + offs_q[:, None] * stride_seq + offs_d[None, :] * stride_dim,
+            mask=valid_q[:, None],
+            other=0.0,
+        )
+
+        M_block = tl.load(
+            M + offset_lse + offs_q,
+            mask=valid_q,
+            other=0.0,
+        )
+
+        D_block = tl.load(
+            D + offset_lse + offs_q,
+            mask=valid_q,
+            other=0.0,
+        )
+
+        QK_T_block = tl.dot(K_block, Q_T_block, input_precision="ieee") * softmax_scale
+
+
+        # [key, query] view of RPB[head, query, key]
+        rpb_T_block = tl.load(
+            RPB
+            + head * SEQ_LEN * SEQ_LEN
+            + offs_q[None, :] * SEQ_LEN
+            + offs_kv[:, None],
+            mask=valid_kv[:, None] & valid_q[None, :],
+            other=0.0,
+        )
+        QK_T_block += rpb_T_block
+
+        if HAS_MASK:
+            window_index = batch % NUM_WINDOWS
+
+            # [key, query] view of MASK[window, query, key]
+            mask_T_block = tl.load(
+                MASK
+                + window_index * SEQ_LEN * SEQ_LEN
+                + offs_q[None, :] * SEQ_LEN
+                + offs_kv[:, None],
+                mask=valid_kv[:, None] & valid_q[None, :],
+                other=0.0,
+            )
+            QK_T_block += mask_T_block
+
+        keep = valid_kv[:, None] & valid_q[None, :]
+
+        QK_T_block = tl.where(keep, QK_T_block, -1.0e20)
+        P_T_block = tl.exp(QK_T_block - M_block[None, :])
+        P_T_block = tl.where(keep, P_T_block, 0.0)
+
+        dV_block += tl.dot(P_T_block, dO_block, input_precision="ieee")
+
+        dP_T_block = tl.dot(V_block, tl.trans(dO_block), input_precision="ieee")
+        dS_T_block = P_T_block * (dP_T_block - D_block[None, :])
+
+        # this atomic add does not cost significant runtime as benchmarked
+        tl.atomic_add(
+            dRPB
+            + head * SEQ_LEN * SEQ_LEN
+            + offs_q[None, :] * SEQ_LEN
+            + offs_kv[:, None],
+            dS_T_block,
+            mask=keep,
+            sem="relaxed",
+        )
+
+        dK_block += softmax_scale * tl.dot(
+            dS_T_block.to(tl.float32),
+            tl.trans(Q_T_block),
+            input_precision="ieee",
+        )
+
+    tl.store(
+        dV + offset + offs_kv[:, None] * stride_seq + offs_d[None, :] * stride_dim,
+        dV_block,
+        mask=valid_kv[:, None],
+    )
+
+    tl.store(
+        dK + offset + offs_kv[:, None] * stride_seq + offs_d[None, :] * stride_dim,
+        dK_block,
+        mask=valid_kv[:, None],
+    )
+
+
+class TritonAttention(torch.autograd.Function):
+    @staticmethod
+    def forward(
+            ctx: Any,
+            Q: torch.Tensor,
+            K: torch.Tensor,
+            V: torch.Tensor,
+            RPB: torch.Tensor,
+            MASK: torch.Tensor | None,
+            softmax_scale: float,
+    ) -> torch.Tensor:
+        assert Q.is_cuda and K.is_cuda and V.is_cuda
+        assert Q.shape == K.shape == V.shape
+        assert Q.is_contiguous()
+        assert K.is_contiguous()
+        assert V.is_contiguous()
+
+        BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM = Q.shape
+        HAS_MASK = MASK is not None
+
+
+        assert RPB.is_cuda
+        assert RPB.is_contiguous()
+        assert RPB.shape == (NUM_HEADS, SEQ_LEN, SEQ_LEN)
+        assert RPB.dtype == Q.dtype
+
+        if HAS_MASK:
+            assert MASK.is_cuda
+            assert MASK.is_contiguous()
+            assert MASK.shape[-2:] == (SEQ_LEN, SEQ_LEN)
+            assert MASK.dtype == Q.dtype
+            NUM_WINDOWS = MASK.shape[0]
+            assert BATCH_SIZE % NUM_WINDOWS == 0
+        else:
+            MASK = torch.empty((1,), device=Q.device, dtype=Q.dtype)
+            NUM_WINDOWS = 1
+
+        O = torch.empty_like(Q)
+        M = torch.empty((BATCH_SIZE, NUM_HEADS, SEQ_LEN), device=Q.device, dtype=torch.float32)
+
+        BLOCK_SIZE_Q = 64
+        BLOCK_SIZE_KV = 64
+
+        grid = (
+            triton.cdiv(SEQ_LEN, BLOCK_SIZE_Q),
+            BATCH_SIZE * NUM_HEADS,
+        )
+
+        _attn_fwd[grid](
+            Q,
+            K,
+            V,
+            softmax_scale,
+            M,
+            O,
+
+            RPB,
+            MASK,
+
+            Q.stride(0),
+            Q.stride(1),
+            Q.stride(2),
+            Q.stride(3),
+            K.stride(0),
+            K.stride(1),
+            K.stride(2),
+            K.stride(3),
+            V.stride(0),
+            V.stride(1),
+            V.stride(2),
+            V.stride(3),
+            O.stride(0),
+            O.stride(1),
+            O.stride(2),
+            O.stride(3),
+
+            NUM_HEADS=NUM_HEADS,
+            SEQ_LEN=SEQ_LEN,
+            HEAD_DIM=HEAD_DIM,
+            BLOCK_SIZE_Q=BLOCK_SIZE_Q,
+            BLOCK_SIZE_KV=BLOCK_SIZE_KV,
+
+            NUM_WINDOWS=NUM_WINDOWS,
+            HAS_MASK=HAS_MASK,
+
+            num_warps=4,
+            num_stages=2,
+        )
+
+        ctx.save_for_backward(Q, K, V, O, M, RPB, MASK)
+        ctx.softmax_scale = softmax_scale
+        ctx.has_mask = HAS_MASK
+        ctx.num_windows = NUM_WINDOWS
+        return O
+
+    @staticmethod
+    def backward(ctx: Any, dO: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, None, None, None]:
+        Q, K, V, O, M, RPB, MASK = ctx.saved_tensors
+
+        dO = dO.contiguous()
+
+        assert Q.is_contiguous()
+        assert K.is_contiguous()
+        assert V.is_contiguous()
+        assert RPB.is_contiguous()
+        assert O.is_contiguous()
+        assert dO.is_contiguous()
+
+        BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM = Q.shape
+
+        dQ = torch.empty_like(Q)
+        dK = torch.empty_like(K)
+        dV = torch.empty_like(V)
+
+        dRPB = torch.empty_like(RPB)
+        dRPB.zero_()
+
+        D = torch.empty_like(M)
+
+        # BLOCK_Q = 64
+        # BLOCK_KV = 64
+
+        preprocess_grid = lambda args: (
+            triton.cdiv(SEQ_LEN, args["BLOCK_SIZE_Q"]),
+            BATCH_SIZE * NUM_HEADS,
+        )
+
+        grid_q = lambda args: (
+            triton.cdiv(SEQ_LEN, args["BLOCK_Q"]),
+            BATCH_SIZE * NUM_HEADS,
+        )
+
+        grid_kv = lambda args: (
+            triton.cdiv(SEQ_LEN, args["BLOCK_KV"]),
+            BATCH_SIZE * NUM_HEADS,
+        )
+
+        # preprocess_grid = (
+        #     triton.cdiv(SEQ_LEN, BLOCK_Q),
+        #     BATCH_SIZE * NUM_HEADS,
+        # )
+
+        _attn_bwd_preprocess[preprocess_grid](
+            O,
+            dO,
+            D,
+            SEQ_LEN=SEQ_LEN,
+            HEAD_DIM=HEAD_DIM,
+
+        )
+
+
+        # grid_q = (
+        #     triton.cdiv(SEQ_LEN, BLOCK_Q),
+        #     BATCH_SIZE * NUM_HEADS,
+        # )
+
+        _attn_bwd_dq[grid_q](
+            Q,
+            K,
+            V,
+            ctx.softmax_scale,
+            dO,
+            dQ,
+            M,
+            D,
+
+            RPB,
+            MASK,
+
+            Q.stride(0),
+            Q.stride(1),
+            Q.stride(2),
+            Q.stride(3),
+
+            NUM_HEADS=NUM_HEADS,
+            SEQ_LEN=SEQ_LEN,
+            HEAD_DIM=HEAD_DIM,
+
+            NUM_WINDOWS=ctx.num_windows,
+            HAS_MASK=ctx.has_mask,
+        )
+
+        # grid_kv = (
+        #     triton.cdiv(SEQ_LEN, BLOCK_KV),
+        #     BATCH_SIZE * NUM_HEADS,
+        # )
+
+        _attn_bwd_dk_dv[grid_kv](
+            Q,
+            K,
+            V,
+            ctx.softmax_scale,
+            dO,
+            dK,
+            dV,
+            dRPB,
+            M,
+            D,
+
+            RPB,
+            MASK,
+
+            Q.stride(0),
+            Q.stride(1),
+            Q.stride(2),
+            Q.stride(3),
+
+            NUM_HEADS=NUM_HEADS,
+            SEQ_LEN=SEQ_LEN,
+            HEAD_DIM=HEAD_DIM,
+            NUM_WINDOWS=ctx.num_windows,
+            HAS_MASK=ctx.has_mask,
+        )
+
+        return dQ, dK, dV, dRPB, None, None, None
