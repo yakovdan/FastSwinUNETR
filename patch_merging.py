@@ -4,6 +4,8 @@ from torch import nn
 from torch.nn import LayerNorm
 import torch
 from torch.nn import functional as F
+from fast_layer_norm import FastLayerNorm, GraphedFastLayerNorm
+
 
 class PatchMergingV2(nn.Module):
     """
@@ -23,12 +25,27 @@ class PatchMergingV2(nn.Module):
 
         super().__init__()
         self.dim = dim
+
         if spatial_dims == 3:
             self.reduction = nn.Linear(8 * dim, 2 * dim, bias=False)
-            self.norm = norm_layer(8 * dim)
+            self.norm = FastLayerNorm(8 * dim)
         elif spatial_dims == 2:
             self.reduction = nn.Linear(4 * dim, 2 * dim, bias=False)
-            self.norm = norm_layer(4 * dim)
+            self.norm = FastLayerNorm(4 * dim)
+
+    def _apply_norm(self, x):
+        # Graphs are inference-only and fixed-shape. Fall back to the eager
+        # module whenever autograd is active (training, or no torch.no_grad()).
+        if (not self.use_cuda_graph) or torch.is_grad_enabled() or x.requires_grad:
+            return self.norm(x)
+        key = (tuple(x.shape), x.dtype)
+        g = self._graphed.get(key)
+        if g is None:  # capture once, on first call for this shape
+            g = GraphedFastLayerNorm(self.norm, x, clone_output=False)
+            self._graphed[key] = g
+        return g(x)  # copy-in + replay
+
+
 
     def forward(self, x):
         x_shape = x.size()
@@ -48,7 +65,7 @@ class PatchMergingV2(nn.Module):
                 x = F.pad(x, (0, 0, 0, w % 2, 0, h % 2))
             x = torch.cat([x[:, j::2, i::2, :] for i, j in itertools.product(range(2), range(2))], -1)
 
-        x = self.norm(x)
+        x = self._apply_norm(x)
         x = self.reduction(x)
         return x
 
@@ -75,6 +92,7 @@ class PatchMerging(PatchMergingV2):
         x6 = x[:, 0::2, 1::2, 1::2, :]
         x7 = x[:, 1::2, 1::2, 1::2, :]
         x = torch.cat([x0, x1, x2, x3, x4, x5, x6, x7], -1)
+
         x = self.norm(x)
         x = self.reduction(x)
         return x

@@ -6,8 +6,8 @@ import torch
 def profile_module_forward(
     module: Any,
     x: torch.Tensor,
-    warmup_iters: int = 25,
-    profile_iters: int = 50,
+    warmup_iters: int = 50,
+    profile_iters: int = 100,
 ) -> dict[str, float]:
     module.eval()
 

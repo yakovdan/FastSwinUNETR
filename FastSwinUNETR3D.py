@@ -1,6 +1,7 @@
 import time
 from typing import Sequence, TypeVar, Union
-
+import os
+os.environ["TRITON_CACHE_DIR"] = "./triton_cache"
 import numpy as np
 from torch import nn
 from torch.nn import LayerNorm
@@ -14,7 +15,8 @@ from patch_merging import PatchMerging, PatchMergingV2
 from einops import rearrange
 from SwinAttention import FastWindowAttention as WindowAttention
 from unter import UnetrBasicBlock, UnetrUpBlock, UnetOutBlock
-
+from fast_layer_norm import FastLayerNorm
+from swin_transformer_block import SwinTransformerBlock3D as SwinTransformerBlock
 Conv = LayerFactory(name="Convolution layers", description="Factory for creating convolution layers.")
 
 @Conv.factory_function("conv")
@@ -48,37 +50,7 @@ def convtrans_factory(dim: int) -> type[nn.ConvTranspose1d | nn.ConvTranspose2d 
 
 MERGING_MODE = {"merging": PatchMerging, "mergingv2": PatchMergingV2}
 
-class DropPath(nn.Module):
-    """Stochastic drop paths per sample for residual blocks.
-    Based on:
-    https://github.com/rwightman/pytorch-image-models
-    """
 
-    def __init__(self, drop_prob: float = 0.0, scale_by_keep: bool = True) -> None:
-        """
-        Args:
-            drop_prob: drop path probability.
-            scale_by_keep: scaling by non-dropped probability.
-        """
-        super().__init__()
-        self.drop_prob = drop_prob
-        self.scale_by_keep = scale_by_keep
-
-        if not (0 <= drop_prob <= 1):
-            raise ValueError("Drop path prob should be between 0 and 1.")
-
-    def drop_path(self, x, drop_prob: float = 0.0, training: bool = False, scale_by_keep: bool = True):
-        if drop_prob == 0.0 or not training:
-            return x
-        keep_prob = 1 - drop_prob
-        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
-        random_tensor = x.new_empty(shape).bernoulli_(keep_prob)
-        if keep_prob > 0.0 and scale_by_keep:
-            random_tensor.div_(keep_prob)
-        return x * random_tensor
-
-    def forward(self, x):
-        return self.drop_path(x, self.drop_prob, self.training, self.scale_by_keep)
 
 class PatchEmbed(nn.Module):
     """
@@ -160,231 +132,10 @@ class PatchEmbed(nn.Module):
                 x = x.transpose(1, 2).view(-1, self.embed_dim, wh, ww)
         return x
 
-SUPPORTED_DROPOUT_MODE = {"vit", "swin", "vista3d"}
-class MLPBlock(nn.Module):
-    """
-    A multi-layer perceptron block, based on: "Dosovitskiy et al.,
-    An Image is Worth 16x16 Words: Transformers for Image Recognition at Scale <https://arxiv.org/abs/2010.11929>"
-    """
-
-    def __init__(
-        self, hidden_size: int, mlp_dim: int, dropout_rate: float = 0.0, act: tuple | str = "GELU", dropout_mode="vit"
-    ) -> None:
-        """
-        Args:
-            hidden_size: dimension of hidden layer.
-            mlp_dim: dimension of feedforward layer. If 0, `hidden_size` will be used.
-            dropout_rate: fraction of the input units to drop.
-            act: activation type and arguments. Defaults to GELU. Also supports "GEGLU" and others.
-            dropout_mode: dropout mode, can be "vit" or "swin".
-                "vit" mode uses two dropout instances as implemented in
-                https://github.com/google-research/vision_transformer/blob/main/vit_jax/models.py#L87
-                "swin" corresponds to one instance as implemented in
-                https://github.com/microsoft/Swin-Transformer/blob/main/models/swin_mlp.py#L23
-                "vista3d" mode does not use dropout.
-
-        """
-
-        super().__init__()
-
-        if not (0 <= dropout_rate <= 1):
-            raise ValueError("dropout_rate should be between 0 and 1.")
-        mlp_dim = mlp_dim or hidden_size
-        act_name, _ = split_args(act)
-        self.linear1 = nn.Linear(hidden_size, mlp_dim) if act_name != "GEGLU" else nn.Linear(hidden_size, mlp_dim * 2)
-        self.linear2 = nn.Linear(mlp_dim, hidden_size)
-        self.fn = get_act_layer(act)
-        # Use Union[nn.Dropout, nn.Identity] for type annotations
-        self.drop1: Union[nn.Dropout, nn.Identity]
-        self.drop2: Union[nn.Dropout, nn.Identity]
-
-        dropout_opt = look_up_option(dropout_mode, SUPPORTED_DROPOUT_MODE)
-        if dropout_opt == "vit":
-            self.drop1 = nn.Dropout(dropout_rate)
-            self.drop2 = nn.Dropout(dropout_rate)
-        elif dropout_opt == "swin":
-            self.drop1 = nn.Dropout(dropout_rate)
-            self.drop2 = self.drop1
-        elif dropout_opt == "vista3d":
-            self.drop1 = nn.Identity()
-            self.drop2 = nn.Identity()
-        else:
-            raise ValueError(f"dropout_mode should be one of {SUPPORTED_DROPOUT_MODE}")
-
-    def forward(self, x):
-        x = self.fn(self.linear1(x))
-        x = self.drop1(x)
-        x = self.linear2(x)
-        x = self.drop2(x)
-        return x
 
 
-class SwinTransformerBlock(nn.Module):
-    """
-    Swin Transformer block based on: "Liu et al.,
-    Swin Transformer: Hierarchical Vision Transformer using Shifted Windows
-    <https://arxiv.org/abs/2103.14030>"
-    https://github.com/microsoft/Swin-Transformer
-    """
 
-    def __init__(
-        self,
-        dim: int,
-        num_heads: int,
-        window_size: Sequence[int],
-        shift_size: Sequence[int],
-        mlp_ratio: float = 4.0,
-        qkv_bias: bool = True,
-        drop: float = 0.0,
-        attn_drop: float = 0.0,
-        drop_path: float = 0.0,
-        act_layer: str = "GELU",
-        norm_layer: type[LayerNorm] = nn.LayerNorm,
-        use_checkpoint: bool = False,
-    ) -> None:
-        """
-        Args:
-            dim: number of feature channels.
-            num_heads: number of attention heads.
-            window_size: local window size.
-            shift_size: window shift size.
-            mlp_ratio: ratio of mlp hidden dim to embedding dim.
-            qkv_bias: add a learnable bias to query, key, value.
-            drop: dropout rate.
-            attn_drop: attention dropout rate.
-            drop_path: stochastic depth rate.
-            act_layer: activation layer.
-            norm_layer: normalization layer.
-            use_checkpoint: use gradient checkpointing for reduced memory usage.
-        """
 
-        super().__init__()
-        self.dim = dim
-        self.num_heads = num_heads
-        self.window_size = window_size
-        self.shift_size = shift_size
-        self.mlp_ratio = mlp_ratio
-        self.use_checkpoint = use_checkpoint
-        self.norm1 = norm_layer(dim)
-        self.attn = WindowAttention(
-            dim,
-            window_size=self.window_size,
-            num_heads=num_heads,
-            qkv_bias=qkv_bias,
-            attn_drop=attn_drop,
-            proj_drop=drop,
-        )
-
-        self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
-        self.norm2 = norm_layer(dim)
-        mlp_hidden_dim = int(dim * mlp_ratio)
-        self.mlp = MLPBlock(hidden_size=dim, mlp_dim=mlp_hidden_dim, act=act_layer, dropout_rate=drop, dropout_mode="swin")
-
-    def forward_part1(self, x, mask_matrix):
-
-        x_shape = x.size()
-        x = self.norm1(x)
-        if len(x_shape) == 5:
-            b, d, h, w, c = x.shape
-            window_size, shift_size = get_window_size((d, h, w), self.window_size, self.shift_size)
-            pad_l = pad_t = pad_d0 = 0
-            pad_d1 = (window_size[0] - d % window_size[0]) % window_size[0]
-            pad_b = (window_size[1] - h % window_size[1]) % window_size[1]
-            pad_r = (window_size[2] - w % window_size[2]) % window_size[2]
-            x = F.pad(x, (0, 0, pad_l, pad_r, pad_t, pad_b, pad_d0, pad_d1))
-            _, dp, hp, wp, _ = x.shape
-            dims = [b, dp, hp, wp]
-
-        else:  # elif len(x_shape) == 4
-            b, h, w, c = x.shape
-            window_size, shift_size = get_window_size((h, w), self.window_size, self.shift_size)
-            pad_l = pad_t = 0
-            pad_b = (window_size[0] - h % window_size[0]) % window_size[0]
-            pad_r = (window_size[1] - w % window_size[1]) % window_size[1]
-            x = F.pad(x, (0, 0, pad_l, pad_r, pad_t, pad_b))
-            _, hp, wp, _ = x.shape
-            dims = [b, hp, wp]
-
-        if any(i > 0 for i in shift_size):
-            if len(x_shape) == 5:
-                shifted_x = torch.roll(x, shifts=(-shift_size[0], -shift_size[1], -shift_size[2]), dims=(1, 2, 3))
-            elif len(x_shape) == 4:
-                shifted_x = torch.roll(x, shifts=(-shift_size[0], -shift_size[1]), dims=(1, 2))
-            attn_mask = mask_matrix
-        else:
-            shifted_x = x
-            attn_mask = None
-        x_windows = window_partition(shifted_x, window_size)
-
-        attn_windows = self.attn(x_windows, mask=attn_mask)
-        attn_windows = attn_windows.view(-1, *(window_size + (c,)))
-        shifted_x = window_reverse(attn_windows, window_size, dims)
-        if any(i > 0 for i in shift_size):
-            if len(x_shape) == 5:
-                x = torch.roll(shifted_x, shifts=(shift_size[0], shift_size[1], shift_size[2]), dims=(1, 2, 3))
-            elif len(x_shape) == 4:
-                x = torch.roll(shifted_x, shifts=(shift_size[0], shift_size[1]), dims=(1, 2))
-        else:
-            x = shifted_x
-
-        if len(x_shape) == 5:
-            if pad_d1 > 0 or pad_r > 0 or pad_b > 0:
-                x = x[:, :d, :h, :w, :].contiguous()
-        elif len(x_shape) == 4:
-            if pad_r > 0 or pad_b > 0:
-                x = x[:, :h, :w, :].contiguous()
-
-        return x
-
-    def forward_part2(self, x):
-        return self.drop_path(self.mlp(self.norm2(x)))
-
-    def load_from(self, weights, n_block, layer):
-        root = f"module.{layer}.0.blocks.{n_block}."
-        block_names = [
-            "norm1.weight",
-            "norm1.bias",
-            "attn.relative_position_bias_table",
-            "attn.relative_position_index",
-            "attn.qkv.weight",
-            "attn.qkv.bias",
-            "attn.proj.weight",
-            "attn.proj.bias",
-            "norm2.weight",
-            "norm2.bias",
-            "mlp.fc1.weight",
-            "mlp.fc1.bias",
-            "mlp.fc2.weight",
-            "mlp.fc2.bias",
-        ]
-        with torch.no_grad():
-            self.norm1.weight.copy_(weights["state_dict"][root + block_names[0]])
-            self.norm1.bias.copy_(weights["state_dict"][root + block_names[1]])
-            self.attn.relative_position_bias_table.copy_(weights["state_dict"][root + block_names[2]])
-            self.attn.relative_position_index.copy_(weights["state_dict"][root + block_names[3]])  # type: ignore[operator]
-            self.attn.qkv.weight.copy_(weights["state_dict"][root + block_names[4]])
-            self.attn.qkv.bias.copy_(weights["state_dict"][root + block_names[5]])
-            self.attn.proj.weight.copy_(weights["state_dict"][root + block_names[6]])
-            self.attn.proj.bias.copy_(weights["state_dict"][root + block_names[7]])
-            self.norm2.weight.copy_(weights["state_dict"][root + block_names[8]])
-            self.norm2.bias.copy_(weights["state_dict"][root + block_names[9]])
-            self.mlp.linear1.weight.copy_(weights["state_dict"][root + block_names[10]])
-            self.mlp.linear1.bias.copy_(weights["state_dict"][root + block_names[11]])
-            self.mlp.linear2.weight.copy_(weights["state_dict"][root + block_names[12]])
-            self.mlp.linear2.bias.copy_(weights["state_dict"][root + block_names[13]])
-
-    def forward(self, x, mask_matrix):
-        shortcut = x
-        if self.use_checkpoint:
-            x = checkpoint.checkpoint(self.forward_part1, x, mask_matrix, use_reentrant=False)
-        else:
-            x = self.forward_part1(x, mask_matrix)
-        x = shortcut + self.drop_path(x)
-        if self.use_checkpoint:
-            x = x + checkpoint.checkpoint(self.forward_part2, x, use_reentrant=False)
-        else:
-            x = x + self.forward_part2(x)
-        return x
 
 class BasicLayer(nn.Module):
     """
@@ -426,6 +177,7 @@ class BasicLayer(nn.Module):
         """
 
         super().__init__()
+        print(f"Depth: {depth}")
         self.window_size = window_size
         self.shift_size = tuple(i // 2 for i in window_size)
         self.no_shift = tuple(0 for i in window_size)
@@ -449,6 +201,10 @@ class BasicLayer(nn.Module):
                 for i in range(depth)
             ]
         )
+        for idx, b in enumerate(self.blocks):
+            out_p = f"SwinTransformerBlock_{idx}_{dim}"
+            print(f"saving to: {out_p}")
+            b.save_init_args(f"{out_p}.pt")
         self.downsample = downsample
         if callable(self.downsample):
             self.downsample = downsample(dim=dim, norm_layer=norm_layer, spatial_dims=len(self.window_size))
