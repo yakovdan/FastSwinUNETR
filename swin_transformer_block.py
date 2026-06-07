@@ -111,6 +111,7 @@ class SwinTransformerBlock3D(InitArgsMixin, nn.Module):
         """
 
         super().__init__()
+        self.save_inputs = False
         self.init_args = {
             "dim": dim,
             "num_heads": num_heads,
@@ -233,6 +234,17 @@ class SwinTransformerBlock3D(InitArgsMixin, nn.Module):
 
 
     def forward(self, x, mask_matrix):
+        if not self.save_inputs:
+            self.save_inputs = True
+            from pathlib import Path
+            fname = Path(f"input_STB_0_{self.dim}.pth")
+            if not (fname.exists() and fname.is_file()):
+                torch.save(x, fname)
+                torch.save(mask_matrix, f"mask_STB_0_{self.dim}.pth")
+            else:
+                fname = Path(f"input_STB_1_{self.dim}.pth")
+                torch.save(x, fname)
+                torch.save(mask_matrix, f"mask_STB_1_{self.dim}.pth")
 
         profile_sections = self.profile_sections
         self.last_section_times_ms = {}
@@ -444,8 +456,19 @@ class SwinTransformerBlock2D(InitArgsMixin, nn.Module):
 
 
 if __name__ == "__main__":
-    pass
-    # x = torch.load('model_input.pt', weights_only=False).to(torch.float32).to("cuda")
+    from pathlib import Path
+    files = sorted(list(Path().glob("SwinTransformerBlock_*.pt")))#, lambda x: int(x.stem.split("_")[-1]))
+
+    for f in files:
+        print(f)
+        count = int(f.stem.split("_")[1])
+        dim=int(int(f.stem.split("_")[2]))
+        x = torch.load(f"input_STB_{count}_{dim}.pth", weights_only=False).to("cuda")
+        mask = torch.load(f"mask_STB_{count}_{dim}.pth", weights_only=False).to("cuda")
+        stb = SwinTransformerBlock3D.from_init_args(str(f)).to("cuda")
+        stb(x, mask)
+
+
     # model = SwinTransformerBlock3D(
     #     in_channels=1,
     #     patch_size=2,
