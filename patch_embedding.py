@@ -1,10 +1,11 @@
-from torch import nn
+from torch import Tensor, nn
 from typing import Sequence
 from torch.nn import LayerNorm
 from swin_unter_utils import ensure_tuple_rep
 import torch.nn.functional as F
 
-
+from jaxtyping import Float, jaxtyped
+from typeguard import typechecked as typechecker
 
 class PatchEmbed2D(nn.Module):
     """
@@ -117,7 +118,17 @@ class PatchEmbed3D(nn.Module):
             in_channels=in_chans, out_channels=embed_dim, kernel_size=patch_size, stride=patch_size
         )
 
-    def forward(self, x):
+    @jaxtyped(typechecker=typechecker)
+    def forward(
+        self,
+        x: Float[Tensor, "b 1 d h w"],
+    ) -> Float[
+        Tensor,
+        "b {self.embed_dim} "
+        "(d+{self.patch_size[0]}-1)//{self.patch_size[0]} "
+        "(h+{self.patch_size[1]}-1)//{self.patch_size[1]} "
+        "(w+{self.patch_size[2]}-1)//{self.patch_size[2]}",
+    ]:
         x_shape = x.size()
         if len(x_shape) != 5:
             raise ValueError(f"expecting 5D x, got {x.shape}.")

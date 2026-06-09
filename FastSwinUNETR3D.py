@@ -432,7 +432,7 @@ class SwinUNETR(nn.Module):
         return logits
 
 if __name__ == "__main__":
-    #x = torch.load('model_input.pt', weights_only=False).to(torch.float32).to("cuda")
+    x = torch.load('model_input.pt', weights_only=False).to(torch.float32).to("cuda")
     model = SwinUNETR(
         in_channels=1,
         patch_size=2,
@@ -443,13 +443,13 @@ if __name__ == "__main__":
         use_checkpoint=True,  # gradient checkpointing for reduced memory use at the cost of compute
     ).to(torch.float32).to("cuda")
 
-    # section_times = profile_module_forward(model, (x, ))
-    #
-    #
-    # total_ms = sum(section_times.values())
-    #
-    # for section_name, elapsed_ms in section_times.items():
-    #     percentage = elapsed_ms / total_ms * 100.0
-    #     print(f"{section_name}: {elapsed_ms:.3f} ms ({percentage:.1f}%)")
-    #
-    # print(f"Total: {total_ms:.3f} ms")
+    section_times = profile_module_forward(model, (x, ))
+
+
+    total_ms = sum(section_times.values())
+
+    for section_name, elapsed_ms in section_times.items():
+        percentage = elapsed_ms / total_ms * 100.0
+        print(f"{section_name}: {elapsed_ms:.3f} ms ({percentage:.1f}%)")
+
+    print(f"Total: {total_ms:.3f} ms")
