@@ -128,6 +128,8 @@ class SwinTransformerBlock3D(InitArgsMixin, nn.Module):
             "use_checkpoint": use_checkpoint,
         }
         #print(f"{self.__class__.__name__}.__init__ args: {self.init_args}")
+        if drop_path != 0:
+            raise ValueError("Drop path is not supported in Swin Transformer blocks. No stochastic depth for now.")
         self.last_section_times_ms = None
         self.profile_sections = True
         self.dim = dim
@@ -153,7 +155,7 @@ class SwinTransformerBlock3D(InitArgsMixin, nn.Module):
             use_tf32=True
         )
 
-        self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+        self.drop_path = nn.Identity()
 
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = MLPBlock(hidden_size=dim, mlp_dim=mlp_hidden_dim, act=act_layer, dropout_rate=drop, dropout_mode="swin", precision="tf32")
