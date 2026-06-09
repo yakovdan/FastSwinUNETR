@@ -1,24 +1,9 @@
-import time
-from typing import Sequence, TypeVar, Union
 import os
 os.environ["TRITON_CACHE_DIR"] = "./triton_cache"
-import numpy as np
+
 from torch import nn
-from torch.nn import LayerNorm
-from torch.utils import checkpoint
-
-from profiling import profile_module_forward
-from swin_unter_utils import ensure_tuple_rep, LayerFactory, look_up_option, split_args, get_act_layer, get_window_size, window_partition, window_reverse, compute_mask
-from torch.nn import functional as F
-import torch
-from patch_merging import PatchMerging, PatchMergingV2
-from einops import rearrange
-from SwinAttention import FastWindowAttention as WindowAttention
-from unter import UnetrBasicBlock, UnetrUpBlock, UnetOutBlock
-from fast_layer_norm import FastLayerNorm
 
 
-SUPPORTED_DROPOUT_MODE = {"vit", "swin", "vista3d"}
 class MLPBlock(nn.Module):
     """
     A multi-layer perceptron block, based on: "Dosovitskiy et al.,
@@ -47,27 +32,13 @@ class MLPBlock(nn.Module):
 
         if not (0 <= dropout_rate <= 1):
             raise ValueError("dropout_rate should be between 0 and 1.")
-        mlp_dim = mlp_dim or hidden_size
-        act_name, _ = split_args(act)
-        self.linear1 = nn.Linear(hidden_size, mlp_dim) if act_name != "GEGLU" else nn.Linear(hidden_size, mlp_dim * 2)
-        self.linear2 = nn.Linear(mlp_dim, hidden_size)
-        self.fn = get_act_layer(act)
-        # Use Union[nn.Dropout, nn.Identity] for type annotations
-        self.drop1: Union[nn.Dropout, nn.Identity]
-        self.drop2: Union[nn.Dropout, nn.Identity]
+        mlp_dim = 4 * hidden_size
 
-        dropout_opt = look_up_option(dropout_mode, SUPPORTED_DROPOUT_MODE)
-        if dropout_opt == "vit":
-            self.drop1 = nn.Dropout(dropout_rate)
-            self.drop2 = nn.Dropout(dropout_rate)
-        elif dropout_opt == "swin":
-            self.drop1 = nn.Dropout(dropout_rate)
-            self.drop2 = self.drop1
-        elif dropout_opt == "vista3d":
-            self.drop1 = nn.Identity()
-            self.drop2 = nn.Identity()
-        else:
-            raise ValueError(f"dropout_mode should be one of {SUPPORTED_DROPOUT_MODE}")
+        self.linear1 = nn.Linear(hidden_size, mlp_dim)
+        self.linear2 = nn.Linear(mlp_dim, hidden_size)
+        self.fn = nn.modules.GELU()
+        self.drop1 = nn.Dropout(dropout_rate)
+        self.drop2 = self.drop1
 
     def forward(self, x):
         x = self.fn(self.linear1(x))

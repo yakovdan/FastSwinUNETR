@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from typing import Any
-from math_utills import *
 import torch
 import triton
 import triton.language as tl

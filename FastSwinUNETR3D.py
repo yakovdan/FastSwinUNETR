@@ -19,6 +19,10 @@ from fast_layer_norm import FastLayerNorm
 from swin_transformer_block import SwinTransformerBlock3D as SwinTransformerBlock
 Conv = LayerFactory(name="Convolution layers", description="Factory for creating convolution layers.")
 
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.set_float32_matmul_precision("high")
+torch.backends.cudnn.allow_tf32 = True
+torch.backends.cudnn.benchmark = True
 @Conv.factory_function("conv")
 def conv_factory(dim: int) -> type[nn.Conv1d | nn.Conv2d | nn.Conv3d]:
     """
@@ -203,8 +207,8 @@ class BasicLayer(nn.Module):
         )
         for idx, b in enumerate(self.blocks):
             out_p = f"SwinTransformerBlock_{idx}_{dim}"
-            print(f"saving to: {out_p}")
-            b.save_init_args(f"{out_p}.pt")
+            #print(f"saving to: {out_p}")
+            #b.save_init_args(f"{out_p}.pt")
         self.downsample = downsample
         if callable(self.downsample):
             self.downsample = downsample(dim=dim, norm_layer=norm_layer, spatial_dims=len(self.window_size))
@@ -293,6 +297,8 @@ class SwinTransformer(nn.Module):
         """
 
         super().__init__()
+        if use_v2:
+            raise ValueError("use_v2 == True is unsupported")
         self.num_layers = len(depths)
         self.embed_dim = embed_dim
         self.patch_norm = patch_norm
@@ -381,20 +387,12 @@ class SwinTransformer(nn.Module):
         x0 = self.patch_embed(x)
         x0 = self.pos_drop(x0)
         x0_out = self.proj_out(x0, normalize)
-        # if self.use_v2:
-        #     x0 = self.layers1c[0](x0.contiguous())
         x1 = self.layers1[0](x0.contiguous())
         x1_out = self.proj_out(x1, normalize)
-        # if self.use_v2:
-        #     x1 = self.layers2c[0](x1.contiguous())
         x2 = self.layers2[0](x1.contiguous())
         x2_out = self.proj_out(x2, normalize)
-        # if self.use_v2:
-        #     x2 = self.layers3c[0](x2.contiguous())
         x3 = self.layers3[0](x2.contiguous())
         x3_out = self.proj_out(x3, normalize)
-        # if self.use_v2:
-        #     x3 = self.layers4c[0](x3.contiguous())
         x4 = self.layers4[0](x3.contiguous())
         x4_out = self.proj_out(x4, normalize)
         return [x0_out, x1_out, x2_out, x3_out, x4_out]
@@ -751,12 +749,12 @@ class SwinUNETR(nn.Module):
             "decoder2",
             lambda: self.decoder2(dec1, enc1),
         )
-
-        out = record_section(
-            "decoder1",
-            lambda: self.decoder1(dec0, enc0),
-        )
-
+        print(f"DEC0 shape: {dec0.shape}, ENC0 shape: {enc0.shape}")
+        # out = record_section(
+        #     "decoder1",
+        #     lambda: self.decoder1(dec0, enc0),
+        # )
+        out = self.decoder1(dec0, enc0)
         logits = record_section(
             "out",
             lambda: self.out(out),
@@ -785,7 +783,7 @@ if __name__ == "__main__":
         use_checkpoint=True,  # gradient checkpointing for reduced memory use at the cost of compute
     ).to(torch.float32).to("cuda")
 
-    section_times = profile_module_forward(model, x)
+    section_times = profile_module_forward(model, (x, ))
 
 
     total_ms = sum(section_times.values())

@@ -5,21 +5,21 @@ import torch
 
 def profile_module_forward(
     module: Any,
-    x: torch.Tensor,
+    x: tuple[torch.Tensor, ...],
     warmup_iters: int = 50,
     profile_iters: int = 100,
 ) -> dict[str, float]:
     module.eval()
-
+    device = x[0].device
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
 
     # Warmup.
     with torch.inference_mode():
         for _ in range(warmup_iters):
-            _ = module(x)
+            _ = module(*x)
 
-    torch.cuda.synchronize(x.device)
+    torch.cuda.synchronize(device)
 
     accumulated_ms: dict[str, float] = defaultdict(float)
 
@@ -27,10 +27,10 @@ def profile_module_forward(
     with torch.inference_mode():
         for _ in range(profile_iters):
             start_event.record()
-            _ = module(x)
+            _ = module(*x)
             end_event.record()
 
-            torch.cuda.synchronize(x.device)
+            torch.cuda.synchronize(device)
             accumulated_ms["forward"] += start_event.elapsed_time(end_event)
             for section_name, elapsed_ms in module.last_section_times_ms.items():
                 accumulated_ms[section_name] += elapsed_ms

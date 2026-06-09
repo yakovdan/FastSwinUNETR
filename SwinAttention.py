@@ -23,7 +23,7 @@ class FastWindowAttention(nn.Module):
     <https://arxiv.org/abs/2103.14030>"
     https://github.com/microsoft/Swin-Transformer
     """
-
+    shapes_seen = set()
     def __init__(
         self,
         dim: int,
@@ -52,6 +52,7 @@ class FastWindowAttention(nn.Module):
         head_dim = dim // num_heads
         self.scale = head_dim**-0.5
         mesh_args = torch.meshgrid.__kwdefaults__
+
 
         if len(self.window_size) == 3:
             self.relative_position_bias_table = nn.Parameter(
@@ -186,7 +187,9 @@ class FastWindowAttention(nn.Module):
         )
         if mask is not None:
             mask = mask.contiguous().to(dtype=q.dtype)
-
+        #print(f"Running attention on {x.shape}")
+        FastWindowAttention.shapes_seen.add(tuple([self.num_heads] + list(x.shape)))
+        #print(f"Seen shapes: {FastWindowAttention.shapes_seen}")
         # Section 4-8, fused Triton attention
         attn = record_section(
             "Section 4-8, Triton fused attention",

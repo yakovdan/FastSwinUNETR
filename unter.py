@@ -102,6 +102,8 @@ class UnetResBlock(nn.Module):
         dropout: tuple | str | float | None = None,
     ):
         super().__init__()
+        self.conv1 = nn.Conv3d(96, 48, 3, 1, 1, bias=False)
+        #self.conv2 = nn.Conv3d(48, 64, 3, 1, 1, bias=False)
         self.conv1 = get_conv_layer(
             spatial_dims,
             in_channels,
