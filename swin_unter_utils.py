@@ -576,6 +576,8 @@ def window_reverse(windows, window_size, dims):
         b, h, w = dims
         x = windows.view(b, h // window_size[0], w // window_size[1], window_size[0], window_size[1], -1)
         x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(b, h, w, -1)
+    else:
+        raise RuntimeError("len(dims) must be 4 or 3")
     return x
 
 
