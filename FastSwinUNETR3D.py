@@ -409,12 +409,12 @@ class SwinUNETR(nn.Module):
             "decoder2",
             lambda: self.decoder2(dec1, enc1),
         )
-        print(f"DEC0 shape: {dec0.shape}, ENC0 shape: {enc0.shape}")
-        # out = record_section(
-        #     "decoder1",
-        #     lambda: self.decoder1(dec0, enc0),
-        # )
-        out = self.decoder1(dec0, enc0)
+        #print(f"DEC0 shape: {dec0.shape}, ENC0 shape: {enc0.shape}")
+        out = record_section(
+            "decoder1",
+            lambda: self.decoder1(dec0, enc0),
+        )
+#        out = self.decoder1(dec0, enc0)
         logits = record_section(
             "out",
             lambda: self.out(out),
