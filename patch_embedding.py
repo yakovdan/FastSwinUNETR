@@ -129,6 +129,15 @@ class PatchEmbed3D(nn.Module):
         "(h+{self.patch_size[1]}-1)//{self.patch_size[1]} "
         "(w+{self.patch_size[2]}-1)//{self.patch_size[2]}",
     ]:
+        """
+        [b c1, d, h, w] -> [b, c2, d, h, w]
+        with c1 being in_channels being 1 and c2 being embed_dim being 48
+        Args:
+            x:
+
+        Returns:
+
+        """
         x_shape = x.size()
         if len(x_shape) != 5:
             raise ValueError(f"expecting 5D x, got {x.shape}.")
@@ -140,6 +149,7 @@ class PatchEmbed3D(nn.Module):
         if d % self.patch_size[0] != 0:
             x = F.pad(x, (0, 0, 0, 0, 0, self.patch_size[0] - d % self.patch_size[0]))
 
-        x = self.proj(x)
+
+        x = self.proj(x) # [b, c1, d, h, w] -> [b, c2, d, h, w]
 
         return x
