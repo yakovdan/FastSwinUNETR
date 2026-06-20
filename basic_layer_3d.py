@@ -80,13 +80,24 @@ class BasicLayer3D(nn.Module):
             self.downsample = downsample(dim=dim, norm_layer=norm_layer, spatial_dims=len(self.window_size))
 
     def forward(self, x):
+        """
+        [b, c, d, h, w] -> [b, c, d, h, w]
+        Args:
+            x:
+
+        Returns:
+
+        """
+        # /start [b, c. d, h, w]
         x_shape = x.size()
         if len(x_shape) != 5:
             raise ValueError(f"expecting 5D x, got {x.shape}.")
 
         b, c, d, h, w = x_shape
         window_size, shift_size = get_window_size((d, h, w), self.window_size, self.shift_size)
+        # /end [b, c. d, h, w]
         x = rearrange(x, "b c d h w -> b d h w c")
+        # /start [b, d. h, w, c]
         dp = int(np.ceil(d / window_size[0])) * window_size[0]
         hp = int(np.ceil(h / window_size[1])) * window_size[1]
         wp = int(np.ceil(w / window_size[2])) * window_size[2]
@@ -96,6 +107,7 @@ class BasicLayer3D(nn.Module):
         x = x.view(b, d, h, w, -1)
         if self.downsample is not None:
             x = self.downsample(x)
+        # /end [b, d. h, w, c]
         x = rearrange(x, "b d h w c -> b c d h w")
-
+        # /start [b, c. d, h, w]
         return x
