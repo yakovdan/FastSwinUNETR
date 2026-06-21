@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from jaxtyping import Float, jaxtyped
 from typeguard import typechecked as typechecker
 
-class PatchEmbed3D(nn.Module):
+class PatchEmbed2D(nn.Module):
     """
     Patch embedding block based on: "Liu et al.,
     Swin Transformer: Hierarchical Vision Transformer using Shifted Windows
@@ -29,7 +29,7 @@ class PatchEmbed3D(nn.Module):
         in_chans: int = 1,
         embed_dim: int = 48,
         norm_layer: type[LayerNorm] | None = nn.LayerNorm,
-        spatial_dims: int = 3,
+        spatial_dims: int = 2,
     ) -> None:
         """
         Args:
@@ -42,8 +42,8 @@ class PatchEmbed3D(nn.Module):
 
         super().__init__()
 
-        if spatial_dims != 3:
-            raise ValueError("spatial dimension should be 3.")
+        if spatial_dims != 2:
+            raise ValueError("spatial dimension should be 2.")
 
         if norm_layer is not None:
             raise ValueError("Currently only None is supported for norm_layer")
@@ -51,42 +51,20 @@ class PatchEmbed3D(nn.Module):
         patch_size = ensure_tuple_rep(patch_size, spatial_dims)
         self.patch_size = patch_size
         self.embed_dim = embed_dim
-        self.proj = nn.Conv3d(
+        self.proj = nn.Conv2d(
             in_channels=in_chans, out_channels=embed_dim, kernel_size=patch_size, stride=patch_size
         )
 
-    @jaxtyped(typechecker=typechecker)
-    def forward(
-        self,
-        x: Float[Tensor, "b 1 d h w"],
-    ) -> Float[
-        Tensor,
-        "b {self.embed_dim} "
-        "(d+{self.patch_size[0]}-1)//{self.patch_size[0]} "
-        "(h+{self.patch_size[1]}-1)//{self.patch_size[1]} "
-        "(w+{self.patch_size[2]}-1)//{self.patch_size[2]}",
-    ]:
-        """
-        [b c1, d, h, w] -> [b, c2, d, h, w]
-        with c1 being in_channels being 1 and c2 being embed_dim being 48
-        Args:
-            x:
 
-        Returns:
-
-        """
+    def forward(self, x):
         x_shape = x.size()
-        if len(x_shape) != 5:
-            raise ValueError(f"expecting 5D x, got {x.shape}.")
-        _, _, d, h, w = x_shape
-        if w % self.patch_size[2] != 0:
-            x = F.pad(x, (0, self.patch_size[2] - w % self.patch_size[2]))
-        if h % self.patch_size[1] != 0:
-            x = F.pad(x, (0, 0, 0, self.patch_size[1] - h % self.patch_size[1]))
-        if d % self.patch_size[0] != 0:
-            x = F.pad(x, (0, 0, 0, 0, 0, self.patch_size[0] - d % self.patch_size[0]))
-
-
-        x = self.proj(x) # [b, c1, d, h, w] -> [b, c2, d, h, w]
+        if len(x_shape) != 4:
+            raise ValueError(f"expecting 4D x, got {x.shape}.")
+        _, _, h, w = x_shape
+        if w % self.patch_size[1] != 0:
+            x = F.pad(x, (0, self.patch_size[1] - w % self.patch_size[1]))
+        if h % self.patch_size[0] != 0:
+            x = F.pad(x, (0, 0, 0, self.patch_size[0] - h % self.patch_size[0]))
+        x = self.proj(x)
 
         return x
