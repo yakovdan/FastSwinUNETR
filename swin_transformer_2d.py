@@ -5,7 +5,7 @@ os.environ["TRITON_CACHE_DIR"] = "./triton_cache"
 import numpy as np
 from torch import nn
 from torch.nn import LayerNorm
-from patch_embedding import PatchEmbed2D
+from patch_embedding_2d import PatchEmbed2D
 
 from swin_unter_utils import LayerFactory, look_up_option, get_window_size, compute_mask
 from torch.nn import functional as F
