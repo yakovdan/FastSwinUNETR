@@ -41,6 +41,90 @@ def profile_module_forward(
     }
 
 
+def profile_module_torch_profiler(
+    module: Any,
+    inputs: tuple[torch.Tensor, ...],
+    *,
+    train: bool = False,
+    warmup_iters: int = 10,
+    profile_iters: int = 8,
+    trace_path: str = "trace.json",
+    loss_fn=None,
+    sort_by: str = "self_cuda_time_total",
+    row_limit: int = 30,
+    record_shapes: bool = True,
+    with_stack: bool = False,
+) -> Any:
+    """Kernel-level profile of ``module(*inputs)`` via ``torch.profiler``.
+
+    Captures CPU+CUDA activities, attributes kernels to the ``record_function``
+    section ranges emitted inside the model, prints an aggregated op table plus
+    a shape-grouped table, and writes a Chrome/Perfetto trace to ``trace_path``.
+
+    train=False profiles the inference forward (eval + inference_mode).
+    train=True profiles a forward+backward step (train mode, grads enabled, so
+    gradient checkpointing actually recomputes in the backward).
+    """
+    from torch.profiler import profile, ProfilerActivity
+
+    device = inputs[0].device
+
+    if loss_fn is None:
+        def loss_fn(out):
+            out = out[0] if isinstance(out, (list, tuple)) else out
+            return out.float().pow(2).mean()
+
+    if train:
+        module.train()
+        # Detached leaves so we don't accumulate grad on the caller's tensors;
+        # a grad-requiring input is also what makes checkpoint recompute.
+        base = [t.detach() if torch.is_tensor(t) else t for t in inputs]
+
+        def step():
+            module.zero_grad(set_to_none=True)
+            iter_inputs = tuple(
+                t.clone().requires_grad_(True)
+                if (torch.is_tensor(t) and t.is_floating_point()) else t
+                for t in base
+            )
+            with torch.enable_grad():
+                loss_fn(module(*iter_inputs)).backward()
+    else:
+        module.eval()
+
+        def step():
+            with torch.inference_mode():
+                module(*inputs)
+
+    # Warmup: lets cudnn.benchmark pick algos and Triton autotune/compile.
+    for _ in range(warmup_iters):
+        step()
+    torch.cuda.synchronize(device)
+
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        record_shapes=record_shapes,
+        profile_memory=True,
+        with_stack=with_stack,
+    ) as prof:
+        for _ in range(profile_iters):
+            step()
+            torch.cuda.synchronize(device)
+
+    prof.export_chrome_trace(trace_path)
+
+    mode = "train (fwd+bwd)" if train else "inference (fwd)"
+    print(f"\n=== top ops by {sort_by} -- {mode} ===")
+    print(prof.key_averages().table(sort_by=sort_by, row_limit=row_limit))
+    if record_shapes:
+        print("\n=== top ops grouped by input shape ===")
+        print(prof.key_averages(group_by_input_shape=True).table(
+            sort_by=sort_by, row_limit=row_limit))
+    print(f"\nChrome/Perfetto trace written to {trace_path} "
+          f"(open in chrome://tracing or https://ui.perfetto.dev)")
+    return prof
+
+
 def profile_original_window_attention_forward(
     module: Any,
     x: torch.Tensor,

@@ -10,15 +10,17 @@ from torch import nn
 from torch.nn import LayerNorm
 from torch.utils import checkpoint
 
-from profiling import profile_module_forward
+from profiling import profile_module_forward, profile_module_torch_profiler
+from torch.profiler import record_function
 from swin_unter_utils import ensure_tuple_rep, LayerFactory, look_up_option, split_args, get_act_layer, get_window_size, window_partition, window_reverse, compute_mask
 from torch.nn import functional as F
 import torch
 from patch_merging import PatchMerging, PatchMergingV2
 from einops import rearrange
-from SwinAttention import FastWindowAttention as WindowAttention
+
+
 from unter import UnetrBasicBlock, UnetrUpBlock, UnetOutBlock
-from fast_layer_norm import FastLayerNorm
+
 from swin_transformer_block import SwinTransformerBlock3D as SwinTransformerBlock
 Conv = LayerFactory(name="Convolution layers", description="Factory for creating convolution layers.")
 
@@ -330,33 +332,37 @@ class SwinUNETR(nn.Module):
             )
 
     def forward(self, x_in):
-        
+        # in: [N, C, D, H , W]
         profile_sections = self.profile_sections
         self.last_section_times_ms = {}
 
         section_events: dict[str, tuple[torch.cuda.Event, torch.cuda.Event]] = {}
 
         def record_section(section_name: str, fn):
-            if not profile_sections:
-                return fn()
+            # Emit NVTX + torch.profiler ranges unconditionally so external
+            # profilers (nsys, torch.profiler) attribute kernels to sections
+            # even when the CUDA-event timing below is disabled.
+            with torch.cuda.nvtx.range(section_name), record_function(section_name):
+                if not profile_sections:
+                    return fn()
 
-            if not x_in.is_cuda:
-                section_start = time.perf_counter()
+                if not x_in.is_cuda:
+                    section_start = time.perf_counter()
+                    result = fn()
+                    self.last_section_times_ms[section_name] = (
+                                                                       time.perf_counter() - section_start
+                                                               ) * 1000.0
+                    return result
+
+                start = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
+
+                start.record()
                 result = fn()
-                self.last_section_times_ms[section_name] = (
-                                                                   time.perf_counter() - section_start
-                                                           ) * 1000.0
+                end.record()
+
+                section_events[section_name] = (start, end)
                 return result
-
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
-
-            start.record()
-            result = fn()
-            end.record()
-
-            section_events[section_name] = (start, end)
-            return result
         
         if not torch.jit.is_scripting() and not torch.jit.is_tracing():
             self._check_input_size(x_in.shape[2:])
@@ -432,6 +438,23 @@ class SwinUNETR(nn.Module):
         return logits
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Profile SwinUNETR.")
+    parser.add_argument(
+        "--mode", choices=["sections", "torch", "nsys"], default="sections",
+        help="sections: per-section CUDA-event timing (default). "
+             "torch: kernel-level torch.profiler table + trace. "
+             "nsys: plain warmup+loop to capture under `nsys profile`.",
+    )
+    parser.add_argument(
+        "--train", action="store_true",
+        help="profile a forward+backward step instead of inference forward.",
+    )
+    parser.add_argument("--iters", type=int, default=None, help="profiled iterations.")
+    parser.add_argument("--trace", default="trace.json", help="torch.profiler trace path.")
+    args = parser.parse_args()
+
     x = torch.load('model_input.pt', weights_only=False).to(torch.float32).to("cuda")
     model = SwinUNETR(
         in_channels=1,
@@ -443,13 +466,57 @@ if __name__ == "__main__":
         use_checkpoint=True,  # gradient checkpointing for reduced memory use at the cost of compute
     ).to(torch.float32).to("cuda")
 
-    section_times = profile_module_forward(model, (x, ))
+    if args.mode == "sections":
+        section_times = profile_module_forward(model, (x, ))
 
+        total_ms = sum(section_times.values())
 
-    total_ms = sum(section_times.values())
+        for section_name, elapsed_ms in section_times.items():
+            percentage = elapsed_ms / total_ms * 100.0
+            print(f"{section_name}: {elapsed_ms:.3f} ms ({percentage:.1f}%)")
 
-    for section_name, elapsed_ms in section_times.items():
-        percentage = elapsed_ms / total_ms * 100.0
-        print(f"{section_name}: {elapsed_ms:.3f} ms ({percentage:.1f}%)")
+        print(f"Total: {total_ms:.3f} ms")
 
-    print(f"Total: {total_ms:.3f} ms")
+    elif args.mode == "torch":
+        # The section CUDA events add a sync per section and are redundant with
+        # the profiler's own timing; disable them so kernels flow uninterrupted
+        # (the NVTX/record_function section labels are still emitted).
+        model.profile_sections = False
+        profile_module_torch_profiler(
+            model, (x, ), train=args.train,
+            profile_iters=args.iters or 8, trace_path=args.trace,
+        )
+
+    elif args.mode == "nsys":
+        # Run under:
+        #   nsys profile -t cuda,nvtx,cudnn,cublas -o swin \
+        #       python FastSwinUNETR3D.py --mode nsys [--train]
+        model.profile_sections = False
+        n = args.iters or 20
+
+        if args.train:
+            model.train()
+            base = x.detach()
+            for _ in range(10):  # warmup (outside the NVTX range below)
+                model.zero_grad(set_to_none=True)
+                xi = base.clone().requires_grad_(True)
+                model(xi).float().pow(2).mean().backward()
+            torch.cuda.synchronize()
+            with torch.cuda.nvtx.range("profiled_iters"):
+                for _ in range(n):
+                    model.zero_grad(set_to_none=True)
+                    xi = base.clone().requires_grad_(True)
+                    model(xi).float().pow(2).mean().backward()
+                    torch.cuda.synchronize()
+        else:
+            model.eval()
+            with torch.inference_mode():
+                for _ in range(10):  # warmup
+                    model(x)
+                torch.cuda.synchronize()
+                with torch.cuda.nvtx.range("profiled_iters"):
+                    for _ in range(n):
+                        model(x)
+                        torch.cuda.synchronize()
+
+        print(f"ran {n} {'train' if args.train else 'inference'} iters for nsys capture")
