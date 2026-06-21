@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fast-swin-unetr"
+version = "0.1.0"
+description = "Accelerating MONAI's SwinUNETR"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "einops",
+    "jaxtyping",
+    "monai",
+    "numpy",
+    "torch",
+    "triton",
+    "typeguard",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest",
+]
+
+[tool.setuptools]
+include-package-data = false
+packages = [
+]
+py-modules = [
+    "FastSwinUNETR3D",
+    "SwinAttention",
+    "basic_layer_2d",
+    "basic_layer_3d",
+    "math_utills",
+    "mlp_block",
+    "patch_embedding_2d",
+    "patch_embedding_3d",
+    "patch_merging",
+    "profiling",
+    "ref_unet_res_block",
+    "ref_unetr_up_block",
+    "swin_transformer_2d",
+    "swin_transformer_3d",
+    "swin_transformer_block",
+    "swin_unter_utils",
+    "triton_shifted_window_fa",
+    "unter",
+]
