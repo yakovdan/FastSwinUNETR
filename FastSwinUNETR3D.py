@@ -1,4 +1,3 @@
-import time
 from typing import Sequence, TypeVar, Union
 import os
 
@@ -11,7 +10,6 @@ from torch.nn import LayerNorm
 from torch.utils import checkpoint
 
 from profiling import profile_module_forward, profile_module_torch_profiler
-from torch.profiler import record_function
 from swin_unter_utils import ensure_tuple_rep, LayerFactory, look_up_option, split_args, get_act_layer, get_window_size, window_partition, window_reverse, compute_mask
 from torch.nn import functional as F
 import torch
@@ -332,109 +330,23 @@ class SwinUNETR(nn.Module):
 
     def forward(self, x_in):
         # in: [N, C, D, H , W]
-        profile_sections = self.profile_sections
-        self.last_section_times_ms = {}
-
-        section_events: dict[str, tuple[torch.cuda.Event, torch.cuda.Event]] = {}
-
-        def record_section(section_name: str, fn):
-            # Emit NVTX + torch.profiler ranges unconditionally so external
-            # profilers (nsys, torch.profiler) attribute kernels to sections
-            # even when the CUDA-event timing below is disabled.
-            with torch.cuda.nvtx.range(section_name), record_function(section_name):
-                if not profile_sections:
-                    return fn()
-
-                if not x_in.is_cuda:
-                    section_start = time.perf_counter()
-                    result = fn()
-                    self.last_section_times_ms[section_name] = (
-                                                                       time.perf_counter() - section_start
-                                                               ) * 1000.0
-                    return result
-
-                start = torch.cuda.Event(enable_timing=True)
-                end = torch.cuda.Event(enable_timing=True)
-
-                start.record()
-                result = fn()
-                end.record()
-
-                section_events[section_name] = (start, end)
-                return result
-        
         if not torch.jit.is_scripting() and not torch.jit.is_tracing():
             self._check_input_size(x_in.shape[2:])
-        hidden_states_out = record_section(
-            "swinViT",
-            lambda: self.swinViT(x_in, self.normalize),
-        )
 
-        enc0 = record_section(
-            "encoder1",
-            lambda: self.encoder1(x_in),
-        )
-
-        enc1 = record_section(
-            "encoder2",
-            lambda: self.encoder2(hidden_states_out[0]),
-        )
-
-        enc2 = record_section(
-            "encoder3",
-            lambda: self.encoder3(hidden_states_out[1]),
-        )
-
-        enc3 = record_section(
-            "encoder4",
-            lambda: self.encoder4(hidden_states_out[2]),
-        )
-
-        dec4 = record_section(
-            "encoder10",
-            lambda: self.encoder10(hidden_states_out[4]),
-        )
-
-        dec3 = record_section(
-            "decoder5",
-            lambda: self.decoder5(dec4, hidden_states_out[3]),
-        )
-
-        dec2 = record_section(
-            "decoder4",
-            lambda: self.decoder4(dec3, enc3),
-        )
-
-        dec1 = record_section(
-            "decoder3",
-            lambda: self.decoder3(dec2, enc2),
-        )
-
-        dec0 = record_section(
-            "decoder2",
-            lambda: self.decoder2(dec1, enc1),
-        )
+        hidden_states_out = self.swinViT(x_in, self.normalize)
+        enc0 = self.encoder1(x_in)
+        enc1 = self.encoder2(hidden_states_out[0])
+        enc2 = self.encoder3(hidden_states_out[1])
+        enc3 = self.encoder4(hidden_states_out[2])
+        dec4 = self.encoder10(hidden_states_out[4])
+        dec3 = self.decoder5(dec4, hidden_states_out[3])
+        dec2 = self.decoder4(dec3, enc3)
+        dec1 = self.decoder3(dec2, enc2)
+        dec0 = self.decoder2(dec1, enc1)
         #print(f"DEC0 shape: {dec0.shape}, ENC0 shape: {enc0.shape}")
-        out = record_section(
-            "decoder1",
-            lambda: self.decoder1(dec0, enc0),
-        )
+        out = self.decoder1(dec0, enc0)
 #        out = self.decoder1(dec0, enc0)
-        logits = record_section(
-            "out",
-            lambda: self.out(out),
-        )
-
-        if profile_sections and x_in.is_cuda:
-            torch.cuda.synchronize()
-            self.last_section_times_ms.update(
-                {
-                    section_name: start.elapsed_time(end)
-                    for section_name, (start, end) in section_events.items()
-                }
-            )
-
-        return logits
+        return self.out(out)
 
 if __name__ == "__main__":
     import argparse
@@ -477,9 +389,8 @@ if __name__ == "__main__":
         print(f"Total: {total_ms:.3f} ms")
 
     elif args.mode == "torch":
-        # The section CUDA events add a sync per section and are redundant with
-        # the profiler's own timing; disable them so kernels flow uninterrupted
-        # (the NVTX/record_function section labels are still emitted).
+        # Run without section-level CUDA events; torch.profiler will attribute
+        # kernels to the lower-level operations it observes.
         model.profile_sections = False
         profile_module_torch_profiler(
             model, (x, ), train=args.train,

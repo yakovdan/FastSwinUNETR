@@ -132,130 +132,26 @@ class FastWindowAttention(nn.Module):
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         b, n, c = x.shape
+        q, k, v = self.qkv(x).reshape(b, n, 3, self.num_heads, c // self.num_heads).permute(2, 0, 3, 1, 4).unbind(0)
 
-        profile_sections = self.profile_sections
-        self.last_section_times_ms = {}
-
-        section_events: dict[str, tuple[torch.cuda.Event, torch.cuda.Event]] = {}
-
-        def record_section(section_name: str, fn):
-            if not profile_sections:
-                return fn()
-
-            if not x.is_cuda:
-                section_start = time.perf_counter()
-                result = fn()
-                self.last_section_times_ms[section_name] = (
-                                                                   time.perf_counter() - section_start
-                                                           ) * 1000.0
-                return result
-
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
-
-            start.record()
-            result = fn()
-            end.record()
-
-            section_events[section_name] = (start, end)
-            return result
-
-        # Section 1, projection
-        q, k, v = record_section(
-            "Section 1, projection",
-            lambda: self.qkv(x)
-            .reshape(b, n, 3, self.num_heads, c // self.num_heads)
-            .permute(2, 0, 3, 1, 4)
-            .unbind(0),
-        )
-
-        # Section 2, scale and Q@K.T
-        # attn = record_section(
-        #     "Section 2, scale and Q@K.T",
-        #     lambda: (q * self.scale) @ k.transpose(-2, -1),
-        # )
-
-        # Section 3, relative position bias
-        relative_position_bias = record_section(
-            "Section 3, relative position bias",
-            lambda: self.relative_position_bias_table[
+        relative_position_bias = self.relative_position_bias_table[
                 self.relative_position_index.clone()[:n, :n].reshape(-1)
-            ]
-            .reshape(n, n, -1)
-            .permute(2, 0, 1)
-            .contiguous().to(dtype=q.dtype)
-        )
+            ].reshape(n, n, -1).permute(2, 0, 1).contiguous().to(dtype=q.dtype)
+
         if mask is not None:
             mask = mask.contiguous().to(dtype=q.dtype)
-        #print(f"Running attention on {x.shape}")
         FastWindowAttention.shapes_seen.add(tuple([self.num_heads] + list(x.shape)))
-        #print(f"Seen shapes: {FastWindowAttention.shapes_seen}")
-        # Section 4-8, fused Triton attention
-        attn = record_section(
-            "Section 4-8, Triton fused attention",
-            lambda: TritonAttention.apply(
-                q.contiguous(),
-                k.contiguous(),
-                v.contiguous(),
-                relative_position_bias,
-                mask,
-                self.scale,
-            ).transpose(1, 2).reshape(b, n, c),
-        )
+        attn = TritonAttention.apply(
+            q.contiguous(),
+            k.contiguous(),
+            v.contiguous(),
+            relative_position_bias,
+            mask,
+            self.scale,
+        ).transpose(1, 2).reshape(b, n, c)
 
+        x = self.proj_drop(self.proj(attn))
 
-        # # Section 4, apply RPB to attention
-        # attn = record_section(
-        #     "Section 4, apply RPB to attention",
-        #     lambda: attn.add_(relative_position_bias.unsqueeze(0))
-        # )
-        #
-        #
-        # # Section 5, add mask
-        # def add_mask():
-        #     if mask is None:
-        #         return attn
-        #
-        #
-        #     nw = mask.shape[0]
-        #     masked_attn = attn.view(
-        #         b // nw, nw, self.num_heads, n, n
-        #     ) + mask.unsqueeze(1).unsqueeze(0)
-        #
-        #     return masked_attn.view(-1, self.num_heads, n, n)
-        #
-        # attn = record_section("Section 5, add mask", add_mask)
-        #
-        # # Section 6, apply softmax
-        # attn = record_section(
-        #     "Section 6, apply softmax",
-        #     lambda: self.softmax(attn),
-        # )
-
-        # Section 7, apply dropout and cast
-        # attn = record_section(
-        #     "Section 7, apply dropout and cast",
-        #     lambda: self.attn_drop(attn).to(v.dtype),
-        # )
-        #
-        # # Section 8, matmul by V
-        # x = record_section(
-        #     "Section 8, matmul by V",
-        #     lambda: (attn @ v).transpose(1, 2).reshape(b, n, c),
-        # )
-
-        # Section 9, projection and dropout
-        x = record_section(
-            "Section 9, projection and dropout",
-            lambda: self.proj_drop(self.proj(attn)),
-        )
-
-        if profile_sections and x.is_cuda:
-            torch.cuda.synchronize(x.device)
-            self.last_section_times_ms = {
-                section_name: start.elapsed_time(end)
-                for section_name, (start, end) in section_events.items()
-            }
         if self.debug_mode:
             return x, q, k, v, relative_position_bias
         return x
