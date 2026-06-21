@@ -21,7 +21,6 @@ from einops import rearrange
 
 from unter import UnetrBasicBlock, UnetrUpBlock, UnetOutBlock
 
-from swin_transformer_block import SwinTransformerBlock3D as SwinTransformerBlock
 Conv = LayerFactory(name="Convolution layers", description="Factory for creating convolution layers.")
 
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -131,8 +130,8 @@ class SwinUNETR(nn.Module):
         self.last_section_times_ms = None
         self.profile_sections = True 
         
-        if spatial_dims not in (2, 3):
-            raise ValueError("spatial dimension should be 2 or 3.")
+        if spatial_dims != 3:
+            raise ValueError("spatial dimension should be 3.")
 
         self.patch_size = patch_size
 
